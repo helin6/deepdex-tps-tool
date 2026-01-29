@@ -48,11 +48,13 @@ const NODE_WS_ADDR: &str = "ws://127.0.0.1:9944";
 
 static ROOTER: LazyLock<Keypair> = LazyLock::new(|| dev::alith());
 
-const MAX_ACTIVE_ORDERS: u32 = 500;
+const MAX_ACTIVE_ORDERS: u32 = 5000;
 
 const SIZE_OF_EACH_ORDER: u128 = 10_000;
 
-const MATCHED_PERCENT: u32 = 1;
+const MATCHED_PERCENT: u32 = 0; // 1%
+
+const PENDING_NUM: u32 = 1;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> anyhow::Result<()> {
@@ -67,7 +69,9 @@ async fn main() -> anyhow::Result<()> {
     // 创建额外账户
     // const N: usize = 10;
     const N: usize = 30;
-    let mut test_accounts = create_extra_test_accounts(N as u32 * 5 * 3).await?;
+
+
+    let mut test_accounts = create_extra_test_accounts(N as u32 * 5 * 1 + 2).await?; //'2' means extra account to place pending orders
 
     tokio::time::sleep(Duration::from_millis(5000)).await;
 
@@ -104,8 +108,8 @@ async fn main() -> anyhow::Result<()> {
     let market_id_doge_usdt = get_market_id_by_name("DOGE_USDT").await?;
 
     let test_accounts_for_btc: &[AccountDetail] = &test_accounts[0.. 5 * N];
-    let test_accounts_for_eth: &[AccountDetail] = &test_accounts[5 * N..10 * N];
-    let test_accounts_for_sol: &[AccountDetail] = &test_accounts[10 * N..15 * N];
+    // let test_accounts_for_eth: &[AccountDetail] = &test_accounts[5 * N..10 * N];
+    // let test_accounts_for_sol: &[AccountDetail] = &test_accounts[10 * N..15 * N];
     // let test_accounts_for_trx: &[AccountDetail] = &test_accounts[15 * N..20 * N];
     // let test_accounts_for_doge: &[AccountDetail] = &test_accounts[20 * N..25 * N];
 
@@ -120,8 +124,8 @@ async fn main() -> anyhow::Result<()> {
     let mut place_order_stubs = Vec::new();
 
     push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_btc, market_id_btc_usdt, 50_000_000, "btc")?;
-    push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_eth, market_id_eth_usdt, 3_000_000, "eth")?;
-    push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_sol, market_id_sol_usdt, 100_000, "sol")?;
+    // push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_eth, market_id_eth_usdt, 3_000_000, "eth")?;
+    // push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_sol, market_id_sol_usdt, 100_000, "sol")?;
     // push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_trx, market_id_trx_usdt, 100_000, "trx")?;
     // push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_doge, market_id_doge_usdt, 100_000, "doge")?;
 
@@ -129,11 +133,11 @@ async fn main() -> anyhow::Result<()> {
     let mut tasks = Vec::new();
 
     // 目前测试，单市场的流量限制为6000 tx/s，能保证完全撮合，超过该值会有很多订单状态不正常
-    // let rate = 120u32; // single thread(full-matched), tps: 6000
-    // let rate = 180u32; // single thread(non-matched), tps: 27000(180*150(acc))
-    // let rate = 70u32; // multi thread(5, full-matched), tps: 17500
-    let rate = 80u32; // multi thread(5, non-matched), tps:
-
+    // let rate = 120; // single thread(full-matched), tps: 6000
+    let rate = 260; // single thread(non-matched), tps: 37500(250*150(acc))
+    // let rate = 70; // multi thread(5, full-matched), tps: 17500
+    // let rate = 260; // multi thread(5, non-matched), tps: 55000(220 * 50(acc) * 5)
+    // let rate = 200;
 
     let n = rate * 60;
     // let n = rate * 1;
@@ -185,10 +189,12 @@ async fn main() -> anyhow::Result<()> {
 
                 let matched_orders_count = p.base_asset_amount / SIZE_OF_EACH_ORDER;
                 info!(
-                    "[{i}]{}, market_id: {}, is_long {}, matched_orders {}, pending_orders {}, unknown_orders {}",
+                    "[{i}]{:?}  subaccount: {:?}, market_id: {}, is_long {}, total_orders {}, matched_orders {}, pending_orders {}, unknown_orders {}",
                     name,
+                    subaccount,
                     p.market_id,
                     p.is_long,
+                    total_order,
                     matched_orders_count,
                     pending_orders_count,
                     n / 2 - matched_orders_count as u32 - pending_orders_count as u32
@@ -202,8 +208,9 @@ async fn main() -> anyhow::Result<()> {
             let orders = api.storage().at_latest().await?.fetch(&orders_query).await?;
             let pending_orders_count = if let Some(orders) = orders { orders.len() } else { 0 };
             info!(
-                "[{i}]{}, market_id: {}, is_long {}, total_orders {}, matched_orders {}, pending_orders {}, cancelled_orders {}",
+                "[{i}]{}, subaccount: {:?}, market_id: {}, is_long {}, total_orders {}, matched_orders {}, pending_orders {}, cancelled_orders {}",
                 name,
+                subaccount,
                 market_id,
                 is_long,
                 total_order,
@@ -393,7 +400,7 @@ async fn place_order_no_wait_response_old_batch(
     price: u128,
     match_price: u128,
     order_type: OrderType,
-    n: u32,
+    mut n: u32,
     rate: u32,
 ) -> anyhow::Result<()> {
     let api = get_api().await?;
@@ -413,12 +420,25 @@ async fn place_order_no_wait_response_old_batch(
     // let mut total_encode_inner = Vec::new();
     let mut encoded_inner = Vec::new();
     let chunk_size = rate;
+
     let mut inner_num: u32 = 0;
+    let mut skip_cancel = false;
+    if user_name.starts_with("extra_pending_user") {
+        n = PENDING_NUM * 2;
+    }
+
     for i in 1..=n {
-    // while i <= n {
         let signed_tx_bytes = if i % 2 == 1 {
-            info!("{user_name} build place order: {} tx for i: {i}", cancel_id + 1);
+            debug!("{user_name} build place order: {} tx for i: {i}", cancel_id + 1);
             cancel_id += 1;
+            let price = target_price(
+                user_name,
+                is_long,
+                price,
+                match_price,
+                cancel_id,
+                &mut skip_cancel,
+            );
             let call = node_runtime::tx().perp_market().place_order(
                 subaccount,
                 market_id,
@@ -441,8 +461,15 @@ async fn place_order_no_wait_response_old_batch(
             let signed_tx = api.tx().create_partial_offline(&call, params)?.sign(user);
             Bytes::from_owner(signed_tx.into_encoded())
         } else {
+            if user_name.starts_with("extra_pending_user") {
+                continue;
+            }
+            if skip_cancel {
+                skip_cancel = false;
+                continue;
+            }
             let order_id = i.saturating_sub(cancel_id);
-            info!("{user_name} build cancel order: {order_id} tx for i: {i}");
+            debug!("{user_name} build cancel order: {order_id} tx for i: {i}");
             let call = node_runtime::tx().perp_market().cancel_order(
                 subaccount,
                 order_id,
@@ -1093,7 +1120,7 @@ async fn create_perp_market(
             last_cacl_funding_rate_time: 1000,
             oracle_price,
             mark_price: oracle_price,
-            max_deviation_bps: 10000,
+            max_deviation_bps: u64::MAX,
             liquid_spread_bps: 10000,
             initial_margin_ratio: 500,     // 5%
             maintenance_margin_ratio: 200, // 2%
@@ -1265,13 +1292,43 @@ pub async fn create_extra_test_accounts(n: u32) -> anyhow::Result<Vec<AccountDet
                 continue;
             }
         }
-        let name = format!("test_user_{addr_idx}");
-        info!("[{i}] init");
+        let name = if i == 1 || i == 2 {
+            format!("extra_pending_user{addr_idx}")
+        } else {
+            format!("test_user_{addr_idx}")
+        };
+        info!("[{i}] account init");
         let account_detail = AccountDetail { name, kp, subaccount: Default::default() };
         result.push(account_detail);
     }
 
     Ok(result)
+}
+
+fn target_price(user_name: &str, is_long: bool, pre_price: u128, match_price: u128, cancel_id: u32, skip_cancel: &mut bool) -> u128 {
+    if user_name.starts_with("extra_pending_user") {
+        return if is_long {
+            pre_price * 100 // 排在最前面
+        } else {
+            1 // 排在最前面
+        }
+    }
+    let price = if MATCHED_PERCENT > 0 {
+        let trigger_match = 100 / MATCHED_PERCENT;
+        if cancel_id >= 100 {
+            if cancel_id % trigger_match == 0 {
+                *skip_cancel = true;
+                match_price
+            } else {
+                pre_price
+            }
+        } else {
+            pre_price
+        }
+    } else {
+        pre_price
+    };
+    price
 }
 
 pub struct AccountDetail {

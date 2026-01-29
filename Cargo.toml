@@ -14,7 +14,7 @@ hex-literal = "1.1.0"
 anyhow = "1.0"
 tracing-subscriber = "0.3.22"
 bytes = "1.11.0"
-precompile-utils = { git = "https://github.com/deepdexfinance/frontier.git", branch = "fast-pool" }
+precompile-utils = { git = "https://github.com/deepdexfinance/frontier.git", branch = "deepdexfinance-par" }
 ethereum = { version = "0.14.0" }
 secp256k1 = "0.30.0"
 env_logger = "0.11.8"
