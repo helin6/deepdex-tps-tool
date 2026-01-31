@@ -59,17 +59,15 @@ const PENDING_NUM: u32 = 1;
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
-
-    // init_rpc_pool().await;
+    let market_num: u32 = 5;
 
     // 准备订单簿，市场等环境
-    prepare_env().await?;
+    let market_ids = prepare_env(market_num).await?;
     let init_quota = 429467295;
 
     // 创建额外账户
     // const N: usize = 10;
     const N: usize = 16;
-
 
     let mut test_accounts = create_extra_test_accounts(N as u32 * 5 * 5 + 2).await?; //'2' means extra account to place pending orders
 
@@ -116,26 +114,34 @@ async fn main() -> anyhow::Result<()> {
     // join_all(tasks).await;
     tokio::time::sleep(Duration::from_millis(5000)).await;
 
-    let market_id_btc_usdt = get_market_id_by_name("BTC_USDT").await?;
-    let market_id_eth_usdt = get_market_id_by_name("ETH_USDT").await?;
-    let market_id_sol_usdt = get_market_id_by_name("SOL_USDT").await?;
-    let market_id_trx_usdt = get_market_id_by_name("TRX_USDT").await?;
-    let market_id_doge_usdt = get_market_id_by_name("DOGE_USDT").await?;
 
-    let test_accounts_for_btc: &[AccountDetail] = &test_accounts[0.. 5 * N];
-    let test_accounts_for_eth: &[AccountDetail] = &test_accounts[5 * N..10 * N];
-    let test_accounts_for_sol: &[AccountDetail] = &test_accounts[10 * N..15 * N];
-    let test_accounts_for_trx: &[AccountDetail] = &test_accounts[15 * N..20 * N];
-    let test_accounts_for_doge: &[AccountDetail] = &test_accounts[20 * N..25 * N];
+    // let market_id_btc_usdt = get_market_id_by_name("BTC_USDT").await?;
+    // let market_id_eth_usdt = get_market_id_by_name("ETH_USDT").await?;
+    // let market_id_sol_usdt = get_market_id_by_name("SOL_USDT").await?;
+    // let market_id_trx_usdt = get_market_id_by_name("TRX_USDT").await?;
+    // let market_id_doge_usdt = get_market_id_by_name("DOGE_USDT").await?;
 
     // (name, keypair, subaccount, market_id, is_long, price, order_type)
     let mut place_order_stubs = Vec::new();
 
-    push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_btc, market_id_btc_usdt, 50_000_000, "btc")?;
-    push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_eth, market_id_eth_usdt, 3_000_000, "eth")?;
-    push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_sol, market_id_sol_usdt, 100_000, "sol")?;
-    push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_trx, market_id_trx_usdt, 100_000, "trx")?;
-    push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_doge, market_id_doge_usdt, 100_000, "doge")?;
+
+    for (index, id) in market_ids.iter().enumerate() {
+        let test_accounts: &[AccountDetail] = &test_accounts[5 * index * N.. 5 * (index + 1) * N];
+        push_order_pairs_for_market(&mut place_order_stubs, test_accounts, *id, 50_000_000, index)?;
+
+    }
+    // let test_accounts_for_btc: &[AccountDetail] = &test_accounts[0.. 5 * N];
+    // let test_accounts_for_eth: &[AccountDetail] = &test_accounts[5 * N..10 * N];
+    // let test_accounts_for_sol: &[AccountDetail] = &test_accounts[10 * N..15 * N];
+    // let test_accounts_for_trx: &[AccountDetail] = &test_accounts[15 * N..20 * N];
+    // let test_accounts_for_doge: &[AccountDetail] = &test_accounts[20 * N..25 * N];
+
+
+    // push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_btc, market_id_btc_usdt, 50_000_000, "btc")?;
+    // push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_eth, market_id_eth_usdt, 3_000_000, "eth")?;
+    // push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_sol, market_id_sol_usdt, 100_000, "sol")?;
+    // push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_trx, market_id_trx_usdt, 100_000, "trx")?;
+    // push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_doge, market_id_doge_usdt, 100_000, "doge")?;
 
     let place_order_func = place_order_no_wait_response_old_batch;
     let mut tasks = Vec::new();
@@ -144,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
     // let rate = 120; // single thread(full-matched), tps: 6000
     // let rate = 250; // single thread(non-matched), tps: 37500(250*150(acc))
     // let rate = 70; // multi thread(5, full-matched), tps: 17500
-    let rate = 250; // multi thread(5, non-matched), tps: 100000(250 * 80(acc) * 5)
+    let rate = 240; // multi thread(5, non-matched), tps: 100000(250 * 80(acc) * 5)
     // let rate = 200;
 
     let n = rate * 60;
@@ -237,7 +243,7 @@ fn push_order_pairs_for_market(
     test_accounts: &[AccountDetail],
     market_id: u16,
     price: u128,
-    market_name: &str,
+    i: usize,
 ) -> anyhow::Result<()> {
     let mut price_diff = 1;
     for chunk in test_accounts.chunks(2) {
@@ -247,7 +253,7 @@ fn push_order_pairs_for_market(
             stubs.push(t2);
             price_diff += 1;
         } else {
-            return Err(anyhow::anyhow!("place_order_stubs {} test_accounts failed", market_name));
+            return Err(anyhow::anyhow!("place_order_stubs market:{} test_accounts failed", i));
         }
     }
     Ok(())
@@ -820,82 +826,9 @@ async fn get_first_subaccount_ensure_exist(user: &Keypair, subaccount_name: &str
     // }
 }
 
-async fn prepare_env() -> anyhow::Result<()> {
-    // Token addresses
-    let usdt_token_address = H160([1u8; 20]);
-    let btc_token_address = H160([2u8; 20]);
-    let eth_token_address = H160([3u8; 20]);
-    let sol_token_address = H160([4u8; 20]);
-    let trx_token_address = H160([5u8; 20]);
-    let doge_token_address = H160([6u8; 20]);
-
-    // 1. Create spot orderbooks
-    create_spot_market(
-        "BTC_USDT",
-        usdt_token_address,
-        "USDT",
-        6,
-        btc_token_address,
-        "BTC",
-        8,
-        2, // btc market index
-        1, // usdt quote index
-    )
-    .await?;
-
-    create_spot_market(
-        "ETH_USDT",
-        usdt_token_address,
-        "USDT",
-        6,
-        eth_token_address,
-        "ETH",
-        8,
-        3, // eth market index
-        1, // usdt quote index
-    )
-    .await?;
-
-    create_spot_market(
-        "SOL_USDT",
-        usdt_token_address,
-        "USDT",
-        6,
-        sol_token_address,
-        "SOL",
-        8,
-        4, // sol market index
-        1, // usdt quote index
-    )
-    .await?;
-
-    create_spot_market(
-        "TRX_USDT",
-        usdt_token_address,
-        "USDT",
-        6,
-        trx_token_address,
-        "TRX",
-        8,
-        5, // trx market index
-        1, // usdt quote index
-    )
-    .await?;
-
-    create_spot_market(
-        "DOGE_USDT",
-        usdt_token_address,
-        "USDT",
-        6,
-        doge_token_address,
-        "DOGE",
-        8,
-        6, // doge market index
-        1, // usdt quote index
-    )
-    .await?;
-
-    // 2. Create lending market
+async fn prepare_env(market_num: u32) -> anyhow::Result<Vec<u16>> {
+    let mut market_id = Vec::new();
+    // Create lending market
     let market_name = "Test_Market";
     let call = node_runtime::Call::Lending(node_runtime::lending::Call::create_market {
         market_id: 1,
@@ -920,15 +853,9 @@ async fn prepare_env() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("Failed to create lending market"));
     }
 
-    // 2.1 Create lending pools
+    // Token addresses
+    let usdt_token_address = H160([1u8; 20]);
     create_lending_pool("USDT", 6, 1_000_000_000_000_000_000, 1_000_000_000_000_000_000).await?;
-    create_lending_pool("BTC", 8, 800_000_000_000_000_000, 850_000_000_000_000_000).await?;
-    create_lending_pool("ETH", 8, 800_000_000_000_000_000, 850_000_000_000_000_000).await?;
-    create_lending_pool("SOL", 8, 800_000_000_000_000_000, 850_000_000_000_000_000).await?;
-    create_lending_pool("TRX", 8, 800_000_000_000_000_000, 850_000_000_000_000_000).await?;
-    create_lending_pool("DOGE", 8, 800_000_000_000_000_000, 850_000_000_000_000_000).await?;
-
-    // 3. Create perp markets
     create_perp_market(
         "QUOTE",
         "USDT",
@@ -943,83 +870,44 @@ async fn prepare_env() -> anyhow::Result<()> {
         1,
     )
         .await?;
+    for i in 1..=market_num {
+        let token_address = H160([i as u8; 20]);
+        let token_name = format!("Token{}", i);
+        create_spot_market(
+            (token_name.clone() + "_USDT").as_str(),
+            usdt_token_address,
+            "USDT",
+            6,
+            token_address,
+            &token_name,
+            8,
+            1 + i as u16, // btc market index
+            1, // usdt quote index
+        )
+            .await?;
 
-    create_perp_market(
-        "BTC_USDT",
-        "BTC",
-        btc_token_address,
-        8,
-        "USDT",
-        usdt_token_address,
-        6,
-        "btc",
-        50_000_000, // 50 USDT
-        2,
-        1,
-    )
-    .await?;
+        // Create lending pools
+        create_lending_pool(&token_name, 8, 1_000_000_000_000_000_000, 1_000_000_000_000_000_000).await?;
+        // Create perp markets
+        create_perp_market(
+            (token_name.clone() + "_USDT").as_str(),
+            &token_name,
+            token_address,
+            8,
+            "NULL",
+            usdt_token_address,
+            6,
+            "quote",
+            50_000_000, // 50 USDT
+            i as u16 + 1,
+            1,
+        )
+            .await?;
 
-    create_perp_market(
-        "ETH_USDT",
-        "ETH",
-        eth_token_address,
-        8,
-        "USDT",
-        usdt_token_address,
-        6,
-        "eth",
-        3_000_000, // 3 USDT
-        3,
-        1,
-    )
-    .await?;
+        market_id.push(i as u16 + 1);
+    }
 
-    create_perp_market(
-        "SOL_USDT",
-        "SOL",
-        sol_token_address,
-        8,
-        "USDT",
-        usdt_token_address,
-        6,
-        "sol",
-        100_000, // 0.1 USDT
-        4,
-        1,
-    )
-    .await?;
-
-    create_perp_market(
-        "TRX_USDT",
-        "TRX",
-        trx_token_address,
-        8,
-        "USDT",
-        usdt_token_address,
-        6,
-        "trx",
-        100_000, // 0.1 USDT
-        5,
-        1,
-    )
-    .await?;
-
-    create_perp_market(
-        "DOGE_USDT",
-        "DOGE",
-        doge_token_address,
-        8,
-        "USDT",
-        usdt_token_address,
-        6,
-        "doge",
-        100_000, // 0.1 USDT
-        6,
-        1,
-    )
-    .await?;
-
-    Ok(())
+    Ok(market_id)
 }
 
 // Helper function to create spot orderbook
