@@ -113,13 +113,6 @@ async fn main() -> anyhow::Result<()> {
     // let test_accounts_for_trx: &[AccountDetail] = &test_accounts[15 * N..20 * N];
     // let test_accounts_for_doge: &[AccountDetail] = &test_accounts[20 * N..25 * N];
 
-    // let test_accounts_for_btc: &[AccountDetail] = &test_accounts[..];
-    // let test_accounts_for_eth: &[AccountDetail] = &test_accounts[50..100];
-    // let test_accounts_for_sol: &[AccountDetail] = &test_accounts[100..150];
-
-    // let test_accounts_for_btc: &[AccountDetail] = &test_accounts[0.. 2];
-
-
     // (name, keypair, subaccount, market_id, is_long, price, order_type)
     let mut place_order_stubs = Vec::new();
 
@@ -487,21 +480,24 @@ async fn place_order_no_wait_response_old_batch(
         encoded_inner.extend(signed_tx_bytes);
         inner_num += 1;
         if inner_num >= chunk_size {
-            let mut extrinsics = Vec::new();
-            Compact(inner_num).encode_to(&mut extrinsics);
-            extrinsics.extend(encoded_inner.clone());
-            // total_encode_inner.push(extrinsics);
-            inner_num = 0;
-            encoded_inner = Vec::new();
-            match rpc.author_submit_extrinsics(&extrinsics).await {
-                Ok(_) => {
-                    info!("{user_name} Submitting batch extrinsics successfully");
-                }
-                Err(e) => {
-                    warn!("Error submitting batch extrinsics for {user_name}: {:?}", e);
-                    continue;
+            loop {
+                let mut extrinsics = Vec::new();
+                Compact(inner_num).encode_to(&mut extrinsics);
+                extrinsics.extend(encoded_inner.clone());
+                match rpc.author_submit_extrinsics(&extrinsics).await {
+                    Ok(_) => {
+                        info!("{user_name} Submitting batch extrinsics successfully");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!("Error submitting batch extrinsics for {user_name}: {:?}, try again", e);
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                        continue;
+                    }
                 }
             }
+            inner_num = 0;
+            encoded_inner = Vec::new();
             tokio::time::sleep_until(next_tick.into()).await;
             next_tick += interval * chunk_size;
         }
