@@ -68,21 +68,36 @@ async fn main() -> anyhow::Result<()> {
 
     // 创建额外账户
     // const N: usize = 10;
-    const N: usize = 30;
+    const N: usize = 16;
 
 
-    let mut test_accounts = create_extra_test_accounts(N as u32 * 5 * 1 + 2).await?; //'2' means extra account to place pending orders
+    let mut test_accounts = create_extra_test_accounts(N as u32 * 5 * 5 + 2).await?; //'2' means extra account to place pending orders
 
     tokio::time::sleep(Duration::from_millis(5000)).await;
 
+    info!("create subaccounts......");
+
     // 创建子账户
+    for x in test_accounts.iter() {
+        let x = x.clone();
+        let _ = get_first_subaccount_ensure_exist(&x.kp, x.name.as_str()).await;
+    }
+
+
+    tokio::time::sleep(Duration::from_millis(5000)).await;
+
     for x in test_accounts.iter_mut() {
-        let subaccount = get_first_subaccount_ensure_exist(&x.kp, x.name.as_str()).await?;
-
-        info!("create or get subaccount {} for {}", x.name, x.kp.public_key().to_account_id());
-
-        let account_detail = AccountDetail { name: x.name.clone(), kp: x.kp.clone(), subaccount};
-        *x = account_detail;
+        if let Ok(subaccounts) = get_subaccount(&x.kp).await {
+            if let Some(subaccount) = subaccounts.get(0) {
+                info!("find subaccount: {:?}", subaccount);
+                let account_detail = AccountDetail { name: x.name.clone(), kp: x.kp.clone(), subaccount: subaccount.clone() };
+                *x = account_detail;
+            } else {
+                warn!("subaccount not find for {:?}", x.name);
+            }
+        } else {
+            panic!("get_subaccount return error")
+        }
     }
 
     // 子账户存款
@@ -99,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
         // tasks.push(t);
     }
     // join_all(tasks).await;
-    tokio::time::sleep(Duration::from_millis(2000)).await;
+    tokio::time::sleep(Duration::from_millis(5000)).await;
 
     let market_id_btc_usdt = get_market_id_by_name("BTC_USDT").await?;
     let market_id_eth_usdt = get_market_id_by_name("ETH_USDT").await?;
@@ -108,28 +123,28 @@ async fn main() -> anyhow::Result<()> {
     let market_id_doge_usdt = get_market_id_by_name("DOGE_USDT").await?;
 
     let test_accounts_for_btc: &[AccountDetail] = &test_accounts[0.. 5 * N];
-    // let test_accounts_for_eth: &[AccountDetail] = &test_accounts[5 * N..10 * N];
-    // let test_accounts_for_sol: &[AccountDetail] = &test_accounts[10 * N..15 * N];
-    // let test_accounts_for_trx: &[AccountDetail] = &test_accounts[15 * N..20 * N];
-    // let test_accounts_for_doge: &[AccountDetail] = &test_accounts[20 * N..25 * N];
+    let test_accounts_for_eth: &[AccountDetail] = &test_accounts[5 * N..10 * N];
+    let test_accounts_for_sol: &[AccountDetail] = &test_accounts[10 * N..15 * N];
+    let test_accounts_for_trx: &[AccountDetail] = &test_accounts[15 * N..20 * N];
+    let test_accounts_for_doge: &[AccountDetail] = &test_accounts[20 * N..25 * N];
 
     // (name, keypair, subaccount, market_id, is_long, price, order_type)
     let mut place_order_stubs = Vec::new();
 
     push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_btc, market_id_btc_usdt, 50_000_000, "btc")?;
-    // push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_eth, market_id_eth_usdt, 3_000_000, "eth")?;
-    // push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_sol, market_id_sol_usdt, 100_000, "sol")?;
-    // push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_trx, market_id_trx_usdt, 100_000, "trx")?;
-    // push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_doge, market_id_doge_usdt, 100_000, "doge")?;
+    push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_eth, market_id_eth_usdt, 3_000_000, "eth")?;
+    push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_sol, market_id_sol_usdt, 100_000, "sol")?;
+    push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_trx, market_id_trx_usdt, 100_000, "trx")?;
+    push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_doge, market_id_doge_usdt, 100_000, "doge")?;
 
     let place_order_func = place_order_no_wait_response_old_batch;
     let mut tasks = Vec::new();
 
     // 目前测试，单市场的流量限制为6000 tx/s，能保证完全撮合，超过该值会有很多订单状态不正常
     // let rate = 120; // single thread(full-matched), tps: 6000
-    let rate = 260; // single thread(non-matched), tps: 37500(250*150(acc))
+    // let rate = 250; // single thread(non-matched), tps: 37500(250*150(acc))
     // let rate = 70; // multi thread(5, full-matched), tps: 17500
-    // let rate = 260; // multi thread(5, non-matched), tps: 55000(220 * 50(acc) * 5)
+    let rate = 250; // multi thread(5, non-matched), tps: 100000(250 * 80(acc) * 5)
     // let rate = 200;
 
     let n = rate * 60;
@@ -485,7 +500,14 @@ async fn place_order_no_wait_response_old_batch(
                 Compact(inner_num).encode_to(&mut extrinsics);
                 extrinsics.extend(encoded_inner.clone());
                 match rpc.author_submit_extrinsics(&extrinsics).await {
-                    Ok(_) => {
+                    Ok(batch_res) => {
+                        for res in batch_res {
+                            if let Err(e) = res {
+                                warn!("Error submitting inner extrinsics for {user_name}: {:?}, try again", e);
+                                // tokio::time::sleep(Duration::from_millis(600)).await;
+                                // continue;
+                            }
+                        }
                         info!("{user_name} Submitting batch extrinsics successfully");
                         break;
                     }
@@ -757,31 +779,45 @@ async fn deposit(kp: &Keypair, subaccount: &H160, market_id: u8, asset: &str, am
 }
 
 async fn get_first_subaccount_ensure_exist(user: &Keypair, subaccount_name: &str) -> anyhow::Result<H160> {
-    if let Ok(subaccounts) = get_subaccount(user).await {
-        if let Some(subaccount) = subaccounts.get(0) {
-            info!("subaccount already exists: {:?}", subaccount);
-            return Ok(*subaccount);
-        }
-    }
+
 
     let api = get_api().await?;
-    let tx_init_subaccount = node_runtime::tx()
+    let mut nonce = api.tx().account_nonce(&user.public_key().to_account_id()).await?;
+    let call = node_runtime::tx()
         .subaccount()
         .initialize_subaccount(BoundedVec(subaccount_name.as_bytes().to_vec()));
-
-    let events = api
-        .tx()
-        .sign_and_submit_then_watch_default(&tx_init_subaccount, user)
-        .await?
-        .wait_for_finalized_success()
-        .await?;
-
-    if let Some(event) = events.find_first::<node_runtime::subaccount::events::NewUserRecord>()? {
-        debug!("subaccount init success: {}", subaccount_name);
-        Ok(event.subaccount)
-    } else {
-        Err(anyhow::anyhow!("Failed to create subaccount"))
+    let rpc_client = RpcClient::from_url(NODE_WS_ADDR).await?;
+    let rpc = LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client);
+    let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
+    let signed_tx = api.tx().create_partial_offline(&call, params)?.sign(user);
+    let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
+    match rpc.author_submit_extrinsic(&call_bytes).await {
+        Ok(_) => {
+            debug!("subaccount init success: {}", subaccount_name);
+        }
+        Err(e) => {
+            warn!("Failed to create subaccount");
+        }
     }
+    Ok(Default::default())
+
+    // let tx_init_subaccount = node_runtime::tx()
+    //     .subaccount()
+    //     .initialize_subaccount(BoundedVec(subaccount_name.as_bytes().to_vec()));
+
+    // let events = api
+    //     .tx()
+    //     .sign_and_submit_then_watch_default(&tx_init_subaccount, user)
+    //     .await?
+    //     .wait_for_finalized_success()
+    //     .await?;
+    //
+    // if let Some(event) = events.find_first::<node_runtime::subaccount::events::NewUserRecord>()? {
+    //     debug!("subaccount init success: {}", subaccount_name);
+    //     Ok(event.subaccount)
+    // } else {
+    //     Err(anyhow::anyhow!("Failed to create subaccount"))
+    // }
 }
 
 async fn prepare_env() -> anyhow::Result<()> {
@@ -1327,6 +1363,7 @@ fn target_price(user_name: &str, is_long: bool, pre_price: u128, match_price: u1
     price
 }
 
+#[derive(Clone)]
 pub struct AccountDetail {
     name: String,
     kp: Keypair,
