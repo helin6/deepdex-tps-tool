@@ -59,7 +59,7 @@ const PENDING_NUM: u32 = 1;
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
-    let market_num: u32 = 5;
+    let market_num: u32 = 10;
 
     // 准备订单簿，市场等环境
     let market_ids = prepare_env(market_num).await?;
@@ -67,9 +67,9 @@ async fn main() -> anyhow::Result<()> {
 
     // 创建额外账户
     // const N: usize = 10;
-    const N: usize = 16;
+    const N: usize = 10;
 
-    let mut test_accounts = create_extra_test_accounts(N as u32 * 5 * 5 + 2).await?; //'2' means extra account to place pending orders
+    let mut test_accounts = create_extra_test_accounts(N as u32 * 5 * market_num + 2).await?; //'2' means extra account to place pending orders
 
     tokio::time::sleep(Duration::from_millis(5000)).await;
 
@@ -122,26 +122,7 @@ async fn main() -> anyhow::Result<()> {
     // let market_id_doge_usdt = get_market_id_by_name("DOGE_USDT").await?;
 
     // (name, keypair, subaccount, market_id, is_long, price, order_type)
-    let mut place_order_stubs = Vec::new();
-
-
-    for (index, id) in market_ids.iter().enumerate() {
-        let test_accounts: &[AccountDetail] = &test_accounts[5 * index * N.. 5 * (index + 1) * N];
-        push_order_pairs_for_market(&mut place_order_stubs, test_accounts, *id, 50_000_000, index)?;
-
-    }
-    // let test_accounts_for_btc: &[AccountDetail] = &test_accounts[0.. 5 * N];
-    // let test_accounts_for_eth: &[AccountDetail] = &test_accounts[5 * N..10 * N];
-    // let test_accounts_for_sol: &[AccountDetail] = &test_accounts[10 * N..15 * N];
-    // let test_accounts_for_trx: &[AccountDetail] = &test_accounts[15 * N..20 * N];
-    // let test_accounts_for_doge: &[AccountDetail] = &test_accounts[20 * N..25 * N];
-
-
-    // push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_btc, market_id_btc_usdt, 50_000_000, "btc")?;
-    // push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_eth, market_id_eth_usdt, 3_000_000, "eth")?;
-    // push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_sol, market_id_sol_usdt, 100_000, "sol")?;
-    // push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_trx, market_id_trx_usdt, 100_000, "trx")?;
-    // push_order_pairs_for_market(&mut place_order_stubs, test_accounts_for_doge, market_id_doge_usdt, 100_000, "doge")?;
+    // let mut place_order_stubs = Vec::new();
 
     let place_order_func = place_order_no_wait_response_old_batch;
     let mut tasks = Vec::new();
@@ -150,59 +131,93 @@ async fn main() -> anyhow::Result<()> {
     // let rate = 120; // single thread(full-matched), tps: 6000
     // let rate = 250; // single thread(non-matched), tps: 37500(250*150(acc))
     // let rate = 70; // multi thread(5, full-matched), tps: 17500
-    let rate = 240; // multi thread(5, non-matched), tps: 100000(250 * 80(acc) * 5)
+    let rate = 180; // multi thread(5, non-matched), tps: 100000(250 * 80(acc) * 5)
     // let rate = 200;
 
     let n = rate * 60;
-    // let n = rate * 1;
 
-    for (name, keypair, subaccount, market_id, is_long, price, match_price, order_type) in place_order_stubs.clone() {
-        // clone for move
-        let name = name.to_string();
-        let keypair = keypair.clone();
+    let mut all_place_order_stubs = Vec::new();
+    for (index, id) in market_ids.iter().enumerate() {
+        let mut place_order_stubs = Vec::new();
+        let test_accounts: &[AccountDetail] = &test_accounts[5 * index * N.. 5 * (index + 1) * N];
+        push_order_pairs_for_market(&mut place_order_stubs, test_accounts, *id, 50_000_000, index)?;
+        all_place_order_stubs.push(place_order_stubs.clone());
+        let out_task = tokio::spawn(async move {
+            let mut inner_task = Vec::new();
+            for (name, keypair, subaccount, market_id, is_long, price, match_price, order_type) in place_order_stubs.clone() {
+                // clone for move
+                let name = name.to_string();
+                let keypair = keypair.clone();
 
-        let task = tokio::spawn(async move {
-            let res = place_order_func(&name, &keypair, subaccount, market_id, is_long, price, match_price, order_type,  n, rate).await;
+                let task = tokio::spawn(async move {
+                    let res = place_order_func(&name, &keypair, subaccount, market_id, is_long, price, match_price, order_type,  n, rate).await;
 
-            match res {
-                Ok(_) => info!("{name} orders placed successfully"),
-                Err(e) => error!("Error placing order for {name}: {:?}", e),
+                    match res {
+                        Ok(_) => info!("{name} orders placed successfully"),
+                        Err(e) => error!("Error placing order for {name}: {:?}", e),
+                    }
+                });
+
+                inner_task.push(task);
+
+                tokio::time::sleep(Duration::from_millis(50)).await; // 避免启动的时候一次性发送大量请求
             }
+
+            join_all(inner_task).await;
+
         });
-
-        tasks.push(task);
-
-        tokio::time::sleep(Duration::from_millis(50)).await; // 避免启动的时候一次性发送大量请求
+        tasks.push(out_task);
     }
-
     join_all(tasks).await;
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // for (name, keypair, subaccount, market_id, is_long, price, match_price, order_type) in place_order_stubs.clone() {
+    //     // clone for move
+    //     let name = name.to_string();
+    //     let keypair = keypair.clone();
+    //
+    //     let task = tokio::spawn(async move {
+    //         let res = place_order_func(&name, &keypair, subaccount, market_id, is_long, price, match_price, order_type,  n, rate).await;
+    //
+    //         match res {
+    //             Ok(_) => info!("{name} orders placed successfully"),
+    //             Err(e) => error!("Error placing order for {name}: {:?}", e),
+    //         }
+    //     });
+    //
+    //     tasks.push(task);
+    //
+    //     tokio::time::sleep(Duration::from_millis(50)).await; // 避免启动的时候一次性发送大量请求
+    // }
+    //
+    // join_all(tasks).await;
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     // 最后查询一下所有的仓位和挂单
     let api = get_api().await?;
-    for (i, (name, keypair, subaccount, market_id, is_long, price, match_price, order_type)) in place_order_stubs.iter().enumerate() {
-        let subaccount_info_query = node_runtime::storage().subaccount().subaccount_info(subaccount.clone());
-        let subaccount_info = api.storage().at_latest().await?.fetch(&subaccount_info_query).await?;
-        let total_order = if let Some(info) = subaccount_info {
-            // info!("account: {:?}, name: {}, total orders: {}", subaccount, name, info.next_order_id.saturating_sub(1));
-            info.next_order_id.saturating_sub(1)
-        } else {
-            0
-        };
+    for place_order_stubs in all_place_order_stubs {
+        for (i, (name, keypair, subaccount, market_id, is_long, price, match_price, order_type)) in place_order_stubs.iter().enumerate() {
+            let subaccount_info_query = node_runtime::storage().subaccount().subaccount_info(subaccount.clone());
+            let subaccount_info = api.storage().at_latest().await?.fetch(&subaccount_info_query).await?;
+            let total_order = if let Some(info) = subaccount_info {
+                // info!("account: {:?}, name: {}, total orders: {}", subaccount, name, info.next_order_id.saturating_sub(1));
+                info.next_order_id.saturating_sub(1)
+            } else {
+                0
+            };
 
-        let position_query = node_runtime::storage().perp_market().user_perp_positions(subaccount.clone());
-        let positions = api.storage().at_latest().await?.fetch(&position_query).await?;
-        if let Some(positions) = positions {
-            for p in positions {
-                let orders_query = node_runtime::storage()
-                    .perp_market()
-                    .active_perp_orders_for(subaccount.clone(), p.market_id);
-                let orders = api.storage().at_latest().await?.fetch(&orders_query).await?;
-                let pending_orders_count = if let Some(orders) = orders { orders.len() } else { 0 };
+            let position_query = node_runtime::storage().perp_market().user_perp_positions(subaccount.clone());
+            let positions = api.storage().at_latest().await?.fetch(&position_query).await?;
+            if let Some(positions) = positions {
+                for p in positions {
+                    let orders_query = node_runtime::storage()
+                        .perp_market()
+                        .active_perp_orders_for(subaccount.clone(), p.market_id);
+                    let orders = api.storage().at_latest().await?.fetch(&orders_query).await?;
+                    let pending_orders_count = if let Some(orders) = orders { orders.len() } else { 0 };
 
-                let matched_orders_count = p.base_asset_amount / SIZE_OF_EACH_ORDER;
-                info!(
+                    let matched_orders_count = p.base_asset_amount / SIZE_OF_EACH_ORDER;
+                    info!(
                     "[{i}]{:?}  subaccount: {:?}, market_id: {}, is_long {}, total_orders {}, matched_orders {}, pending_orders {}, unknown_orders {}",
                     name,
                     subaccount,
@@ -213,15 +228,15 @@ async fn main() -> anyhow::Result<()> {
                     pending_orders_count,
                     n / 2 - matched_orders_count as u32 - pending_orders_count as u32
                 );
-            }
-        } else {
-            warn!("[{i}]{:?}, no positions found", name);
-            let orders_query = node_runtime::storage()
-                .perp_market()
-                .active_perp_orders_for(subaccount.clone(), *market_id);
-            let orders = api.storage().at_latest().await?.fetch(&orders_query).await?;
-            let pending_orders_count = if let Some(orders) = orders { orders.len() } else { 0 };
-            info!(
+                }
+            } else {
+                warn!("[{i}]{:?}, no positions found", name);
+                let orders_query = node_runtime::storage()
+                    .perp_market()
+                    .active_perp_orders_for(subaccount.clone(), *market_id);
+                let orders = api.storage().at_latest().await?.fetch(&orders_query).await?;
+                let pending_orders_count = if let Some(orders) = orders { orders.len() } else { 0 };
+                info!(
                 "[{i}]{}, subaccount: {:?}, market_id: {}, is_long {}, total_orders {}, matched_orders {}, pending_orders {}, cancelled_orders {}",
                 name,
                 subaccount,
@@ -232,7 +247,9 @@ async fn main() -> anyhow::Result<()> {
                 pending_orders_count,
                 total_order as usize - pending_orders_count
             );
+            }
         }
+
     }
 
     Ok(())
