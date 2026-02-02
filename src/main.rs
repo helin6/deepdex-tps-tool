@@ -1,6 +1,7 @@
 #![allow(missing_docs)]
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use crate::node_runtime::perp_market::calls::types;
 use crate::node_runtime::perp_market::calls::types::place_order::OrderType;
 use crate::node_runtime::runtime_types::ethereum::transaction::{EIP1559Transaction, TransactionAction, TransactionV2};
@@ -38,7 +39,9 @@ use precompile_utils::solidity::codec::Writer as EvmDataWriter;
 use secp256k1::ecdsa::RecoveryId;
 use subxt::ext::codec::{Compact, Encode};
 use subxt::ext::futures::future::join_all;
+use subxt::ext::futures::StreamExt;
 use subxt_signer::{DEV_PHRASE, bip39};
+use tokio::sync::mpsc::UnboundedSender;
 use crate::node_runtime::perp_market::calls::types::cancel_order::CancelReason;
 
 // 0x18ae37ea
@@ -59,7 +62,8 @@ const PENDING_NUM: u32 = 1;
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
-    let market_num: u32 = 10;
+    let market_num: u32 = 1;
+    let pool_sender_num: u32 = 10;
 
     // 准备订单簿，市场等环境
     let market_ids = prepare_env(market_num).await?;
@@ -67,9 +71,9 @@ async fn main() -> anyhow::Result<()> {
 
     // 创建额外账户
     // const N: usize = 10;
-    const N: usize = 10;
+    const N: usize = 50;
 
-    let mut test_accounts = create_extra_test_accounts(N as u32 * 5 * market_num + 2).await?; //'2' means extra account to place pending orders
+    let mut test_accounts = create_extra_test_accounts(N as u32 * 5 * market_num).await?; //'2' means extra account to place pending orders
 
     tokio::time::sleep(Duration::from_millis(5000)).await;
 
@@ -113,28 +117,82 @@ async fn main() -> anyhow::Result<()> {
     }
     // join_all(tasks).await;
     tokio::time::sleep(Duration::from_millis(5000)).await;
-
-
-    // let market_id_btc_usdt = get_market_id_by_name("BTC_USDT").await?;
-    // let market_id_eth_usdt = get_market_id_by_name("ETH_USDT").await?;
-    // let market_id_sol_usdt = get_market_id_by_name("SOL_USDT").await?;
-    // let market_id_trx_usdt = get_market_id_by_name("TRX_USDT").await?;
-    // let market_id_doge_usdt = get_market_id_by_name("DOGE_USDT").await?;
-
-    // (name, keypair, subaccount, market_id, is_long, price, order_type)
-    // let mut place_order_stubs = Vec::new();
-
-    let place_order_func = place_order_no_wait_response_old_batch;
-    let mut tasks = Vec::new();
-
     // 目前测试，单市场的流量限制为6000 tx/s，能保证完全撮合，超过该值会有很多订单状态不正常
     // let rate = 120; // single thread(full-matched), tps: 6000
-    // let rate = 250; // single thread(non-matched), tps: 37500(250*150(acc))
+    let rate = 200; // single thread(non-matched), tps: 50000(200*250(acc))
     // let rate = 70; // multi thread(5, full-matched), tps: 17500
-    let rate = 180; // multi thread(5, non-matched), tps: 100000(250 * 80(acc) * 5)
+    // let rate = 200; // multi thread(5, non-matched), tps: 100000(250 * 80(acc) * 5)
     // let rate = 200;
 
     let n = rate * 60;
+
+
+    let total_acc_num = test_accounts.len();
+    let mut tasks = Vec::new();
+
+    let tx_senders: Vec<_> =
+        (0..pool_sender_num).into_iter().map(|_i| {
+            let (sender, mut rec) = tokio::sync::mpsc::unbounded_channel::<(Vec<Bytes>, String)>();
+            let pool_task = tokio::spawn(async move {
+                let mut encoded_inner = Vec::new();
+                let mut inner_num: u32 = 0;
+                let rpc_client = RpcClient::from_url(NODE_WS_ADDR).await.unwrap();
+                let rpc = LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client);
+                let pool_rate = total_acc_num as u32 * rate / pool_sender_num;
+                let mut now = std::time::Instant::now();
+                let mut sender_count = 0;
+                let mut start: Option<std::time::Instant> = None;
+                let mut user_name_record = HashSet::new();
+                loop {
+                    if sender_count >= 60 {
+                        info!("pool submit finish in {:?}, users num: {}", start.unwrap().elapsed(), user_name_record.len());
+                        break;
+                    }
+                    if let Some((v, user_name)) = rec.recv().await {
+                        user_name_record.insert(user_name.clone());
+                        inner_num += v.len() as u32;
+                        for i in v {
+                            encoded_inner.extend(i);
+                        }
+                        if inner_num >= pool_rate {
+                            if sender_count == 0 {
+                                start = Some(std::time::Instant::now());
+                            }
+                            let mut extrinsics = Vec::new();
+                            Compact(inner_num).encode_to(&mut extrinsics);
+                            extrinsics.extend(encoded_inner.clone());
+                            if now.elapsed() < Duration::from_secs(1) {
+                                tokio::time::sleep(Duration::from_secs(1) - now.elapsed()).await;
+                            }
+                            now = std::time::Instant::now();
+                            match rpc.author_submit_extrinsics(&extrinsics).await {
+                                Ok(batch_res) => {
+                                    for res in batch_res {
+                                        if let Err(e) = res {
+                                            warn!("Error submitting inner extrinsics for {user_name}: {:?}, try again", e);
+                                            // tokio::time::sleep(Duration::from_millis(600)).await;
+                                            // continue;
+                                        }
+                                    }
+                                    info!("Submitting batch extrinsics successfully, users num: {}", user_name_record.len());
+                                }
+                                Err(e) => {
+                                    warn!("Error submitting batch extrinsics for {user_name}: {:?}, try again", e);
+                                }
+                            }
+                            inner_num = 0;
+                            encoded_inner.clear();
+                            sender_count += 1;
+                        }
+                    }
+                }
+            });
+            tasks.push(pool_task);
+            sender
+        }).collect()
+    ;
+    let place_order_func = place_order_no_wait_response_old_batch;
+
 
     let mut all_place_order_stubs = Vec::new();
     for (index, id) in market_ids.iter().enumerate() {
@@ -142,16 +200,16 @@ async fn main() -> anyhow::Result<()> {
         let test_accounts: &[AccountDetail] = &test_accounts[5 * index * N.. 5 * (index + 1) * N];
         push_order_pairs_for_market(&mut place_order_stubs, test_accounts, *id, 50_000_000, index)?;
         all_place_order_stubs.push(place_order_stubs.clone());
+        let tx_senders = tx_senders.clone();
         let out_task = tokio::spawn(async move {
             let mut inner_task = Vec::new();
-            for (name, keypair, subaccount, market_id, is_long, price, match_price, order_type) in place_order_stubs.clone() {
+            for (inner_index, (name, keypair, subaccount, market_id, is_long, price, match_price, order_type)) in place_order_stubs.clone().into_iter().enumerate() {
                 // clone for move
                 let name = name.to_string();
                 let keypair = keypair.clone();
-
+                let pool_sender = tx_senders[inner_index % pool_sender_num as usize].clone();
                 let task = tokio::spawn(async move {
-                    let res = place_order_func(&name, &keypair, subaccount, market_id, is_long, price, match_price, order_type,  n, rate).await;
-
+                    let res = place_order_func(&name, &keypair, subaccount, market_id, is_long, price, match_price, order_type,  n, rate, pool_sender).await;
                     match res {
                         Ok(_) => info!("{name} orders placed successfully"),
                         Err(e) => error!("Error placing order for {name}: {:?}", e),
@@ -191,7 +249,7 @@ async fn main() -> anyhow::Result<()> {
     //
     // join_all(tasks).await;
 
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // 最后查询一下所有的仓位和挂单
     let api = get_api().await?;
@@ -433,6 +491,7 @@ async fn place_order_no_wait_response_old_batch(
     order_type: OrderType,
     mut n: u32,
     rate: u32,
+    mut pool_sender: tokio::sync::mpsc::UnboundedSender<(Vec<Bytes>, String)>,
 ) -> anyhow::Result<()> {
     let api = get_api().await?;
     let mut nonce = std::time::SystemTime::now()
@@ -460,7 +519,7 @@ async fn place_order_no_wait_response_old_batch(
 
     for i in 1..=n {
         let signed_tx_bytes = if i % 2 == 1 {
-            debug!("{user_name} build place order: {} tx for i: {i}", cancel_id + 1);
+            info!("{user_name} subaccount: {subaccount:?} build place order: {} tx with nonce: {nonce} for i: {i}", cancel_id + 1);
             cancel_id += 1;
             let price = target_price(
                 user_name,
@@ -485,8 +544,8 @@ async fn place_order_no_wait_response_old_batch(
                 PostOnlyParam::None,
             );
             // 等到下一次发送时刻
-            tokio::time::sleep_until(next_tick.into()).await;
-            next_tick += interval;
+            // tokio::time::sleep_until(next_tick.into()).await;
+            // next_tick += interval;
 
             let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
             let signed_tx = api.tx().create_partial_offline(&call, params)?.sign(user);
@@ -500,7 +559,7 @@ async fn place_order_no_wait_response_old_batch(
                 continue;
             }
             let order_id = i.saturating_sub(cancel_id);
-            debug!("{user_name} build cancel order: {order_id} tx for i: {i}");
+            info!("{user_name} subaccount: {subaccount:?} build cancel order: {order_id} tx with nonce: {nonce} for i: {i}");
             let call = node_runtime::tx().perp_market().cancel_order(
                 subaccount,
                 order_id,
@@ -508,43 +567,18 @@ async fn place_order_no_wait_response_old_batch(
                 CancelReason::UserCanceled,
             );
             // 等到下一次发送时刻
-            tokio::time::sleep_until(next_tick.into()).await;
-            next_tick += interval;
+            // tokio::time::sleep_until(next_tick.into()).await;
+            // next_tick += interval;
 
             let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
             let signed_tx = api.tx().create_partial_offline(&call, params)?.sign(user);
             Bytes::from_owner(signed_tx.into_encoded())
         };
-        encoded_inner.extend(signed_tx_bytes);
-        inner_num += 1;
-        if inner_num >= chunk_size {
-            loop {
-                let mut extrinsics = Vec::new();
-                Compact(inner_num).encode_to(&mut extrinsics);
-                extrinsics.extend(encoded_inner.clone());
-                match rpc.author_submit_extrinsics(&extrinsics).await {
-                    Ok(batch_res) => {
-                        for res in batch_res {
-                            if let Err(e) = res {
-                                warn!("Error submitting inner extrinsics for {user_name}: {:?}, try again", e);
-                                // tokio::time::sleep(Duration::from_millis(600)).await;
-                                // continue;
-                            }
-                        }
-                        info!("{user_name} Submitting batch extrinsics successfully");
-                        break;
-                    }
-                    Err(e) => {
-                        warn!("Error submitting batch extrinsics for {user_name}: {:?}, try again", e);
-                        tokio::time::sleep(Duration::from_millis(600)).await;
-                        continue;
-                    }
-                }
-            }
-            inner_num = 0;
-            encoded_inner = Vec::new();
-            tokio::time::sleep_until(next_tick.into()).await;
-            next_tick += interval * chunk_size;
+
+
+        encoded_inner.push(signed_tx_bytes);
+        if encoded_inner.len() >= chunk_size as usize {
+            pool_sender.send((std::mem::take(&mut encoded_inner), user_name.to_string()))?;
         }
         nonce += 1;
     }
@@ -1229,11 +1263,12 @@ pub async fn create_extra_test_accounts(n: u32) -> anyhow::Result<Vec<AccountDet
                 continue;
             }
         }
-        let name = if i == 1 || i == 2 {
-            format!("extra_pending_user{addr_idx}")
-        } else {
-            format!("test_user_{addr_idx}")
-        };
+        // let name = if i == 1 || i == 2 {
+        //     format!("extra_pending_user{addr_idx}")
+        // } else {
+        //     format!("test_user_{addr_idx}")
+        // };
+        let name = format!("test_user_{addr_idx}");
         info!("[{i}] account init");
         let account_detail = AccountDetail { name, kp, subaccount: Default::default() };
         result.push(account_detail);
@@ -1267,7 +1302,6 @@ fn target_price(user_name: &str, is_long: bool, pre_price: u128, match_price: u1
     };
     price
 }
-
 #[derive(Clone)]
 pub struct AccountDetail {
     name: String,
