@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use crate::node_runtime::perp_market::calls::types;
 use crate::node_runtime::perp_market::calls::types::place_order::OrderType;
 use crate::node_runtime::runtime_types::ethereum::transaction::{EIP1559Transaction, TransactionAction, TransactionV2};
-use crate::node_runtime::runtime_types::pallet_primitives::types::{MarketSpec, PostOnlyParam, SingleOperation, PerpOperation, BorrowRateCurve, PlaceParams, CancelParams, LiquidationSpec, LiquidationFeeRate};
+use crate::node_runtime::runtime_types::pallet_primitives::types::{MarketSpec, PostOnlyParam, SingleOperation, PerpOperation, BorrowRateCurve, PlaceParams, CancelParams, LiquidationSpec, LiquidationFeeRate, OrderStatus};
 use crate::node_runtime::runtime_types::primitive_types::U256;
 use crate::node_runtime::runtime_types::sp_arithmetic::fixed_point::FixedI128;
 use bytes::Bytes;
@@ -43,6 +43,7 @@ use subxt::ext::futures::StreamExt;
 use subxt_signer::{DEV_PHRASE, bip39};
 use tokio::sync::mpsc::UnboundedSender;
 use crate::node_runtime::perp_market::calls::types::cancel_order::CancelReason;
+use crate::node_runtime::runtime_types::pallet_perp_market::orders::types::PerpOrder;
 
 // 0x18ae37ea
 const PERP_PLACE_ORDER_SELECTOR: [u8; 4] = [24, 174, 55, 234];
@@ -51,46 +52,50 @@ const NODE_WS_ADDR: &str = "ws://127.0.0.1:9944";
 
 static ROOTER: LazyLock<Keypair> = LazyLock::new(|| dev::alith());
 
-const MAX_ACTIVE_ORDERS: u32 = 5000;
+const MAX_ACTIVE_ORDERS: u32 = 500000;
 
 const SIZE_OF_EACH_ORDER: u128 = 10_000;
 
 const MATCHED_PERCENT: u32 = 0; // 1%
 
-const PENDING_NUM: u32 = 1;
+const PENDING_NUM: u32 = 0;
 
 const BATCH_OPS_NUM: u32 = 10;
+
+const MARKET_NUM: u32 = 1;
+
+const N: usize = 40;
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
-    let market_num: u32 = 1;
     let pool_sender_num: u32 = 20;
 
     // 准备订单簿，市场等环境
-    let market_ids = prepare_env(market_num).await?;
+    let market_ids = prepare_env(MARKET_NUM).await?;
     let init_quota = 429467295;
 
     // 创建额外账户
     // const N: usize = 10;
-    const N: usize = 40;
+    // const N: usize = 40;
+    let extra_account_num = PENDING_NUM / 1000;
 
     info!("init wallet account......");
-    let mut test_accounts = create_extra_test_accounts(N as u32 * 5 * market_num).await?; //'2' means extra account to place pending orders
+    let mut test_accounts_with_extra = create_extra_test_accounts(N as u32 * 5 * MARKET_NUM + extra_account_num).await?; //'2' means extra account to place pending orders
 
     tokio::time::sleep(Duration::from_millis(5000)).await;
 
     info!("create subaccounts......");
 
     // 创建子账户
-    for x in test_accounts.iter() {
+    for x in test_accounts_with_extra.iter() {
         let x = x.clone();
         let _ = get_first_subaccount_ensure_exist(&x.kp, x.name.as_str()).await;
     }
 
-
     tokio::time::sleep(Duration::from_millis(5000)).await;
 
-    for x in test_accounts.iter_mut() {
+    for x in test_accounts_with_extra.iter_mut() {
         if let Ok(subaccounts) = get_subaccount(&x.kp).await {
             if let Some(subaccount) = subaccounts.get(0) {
                 info!("find subaccount: {:?}", subaccount);
@@ -108,21 +113,82 @@ async fn main() -> anyhow::Result<()> {
     let amount = 100_000_000_000_000_000_000_000_000_000u128;
 
     // let mut tasks = Vec::new();
-    for x in &test_accounts {
+    for x in &test_accounts_with_extra {
         let kp = x.kp.clone();
         let subaccount = x.subaccount.clone();
         info!("do deposit by account: {:?}", hex::encode(&kp.public_key().to_account_id().0));
         deposit(&kp, &subaccount, 1, "USDT", amount).await.unwrap();
     }
     tokio::time::sleep(Duration::from_millis(5000)).await;
-    // let rate = 120; // single thread(full-matched), tps: 6000
+    // let rate = 70; // single thread(full-matched), tps: 6000
     // let rate = 200; // single thread(non-matched), tps: 50000(200*250(acc))
-    let rate = 430; // single thread(non-matched), batch ops tps: 85000(43 * 10(ops) * 200(acc))
+    let rate = 570; // single thread(non-matched), batch ops: 112000(56 * 10(ops) * 200(acc))
     // let rate = 70; // multi thread(5, full-matched), tps: 17500
     // let rate = 200; // multi thread(5, non-matched), tps: 100000(250 * 80(acc) * 5)
 
     let n = rate * 60;
 
+
+
+    let mut test_accounts: Vec<_> = test_accounts_with_extra.drain(extra_account_num as usize..).collect();
+
+    if PENDING_NUM > 1 {
+        info!("insert extra pending orders");
+        let mut place_order_stubs = Vec::new();
+        let extra_accounts: &[AccountDetail] = &test_accounts_with_extra;
+        push_order_pairs_for_market(&mut place_order_stubs, extra_accounts, 2, 50_000_000, 0)?;
+        let mut extra_task = Vec::new();
+        let extra_len = test_accounts_with_extra.len() as u32;
+        for (index, (name, keypair, subaccount, market_id, is_long, price, match_price, order_type)) in place_order_stubs.clone().into_iter().enumerate() {
+            let task = tokio::spawn(async move {
+                let res = place_extra_pending_orders(
+                    &name,
+                    &keypair,
+                    subaccount,
+                    market_id,
+                    is_long,
+                    price,
+                    match_price,
+                    order_type,
+                    PENDING_NUM / (extra_len / 2u32),
+                    400,
+                    index,
+                    true
+                ).await;
+                match res {
+                    Ok(_) => info!("******extra {name} orders placed successfully"),
+                    Err(e) => error!("Error placing order for {name}: {:?}", e),
+                }
+            });
+            extra_task.push(task);
+        }
+        join_all(extra_task).await;
+        tokio::time::sleep(Duration::from_millis(10000)).await;
+
+
+        let api = get_api().await?;
+        let mut total_pending_ords_num = 0;
+        for (name, keypair, subaccount, market_id, is_long, price, match_price, order_type) in place_order_stubs {
+            let orders_query = node_runtime::storage()
+                .perp_market()
+                .active_perp_orders_for(subaccount.clone(), market_id);
+            // loop {
+
+                let orders = api.storage().at_latest().await?.fetch(&orders_query).await?.unwrap();
+                let expect_pending_for_owner = PENDING_NUM / (extra_len / 2u32);
+                // if orders.len() as u32 >= expect_pending_for_owner {
+                    info!("******extra {name} has {} pending orders", orders.len());
+                    // break;
+                // }
+
+            total_pending_ords_num += orders.len();
+            // }
+
+        }
+        info!("******total pending orders: {}", total_pending_ords_num);
+
+
+    }
 
     let total_acc_num = test_accounts.len();
     let mut tasks = Vec::new();
@@ -148,7 +214,7 @@ async fn main() -> anyhow::Result<()> {
                         break;
                     }
                     if let Some((v, user_name)) = rec.recv().await {
-                        info!("receive {user_name} call length {}", v.len());
+                        debug!("receive {user_name} call length {}", v.len());
 
                         user_name_record.insert(user_name.clone());
                         inner_num += BATCH_OPS_NUM * v.len() as u32;
@@ -176,7 +242,7 @@ async fn main() -> anyhow::Result<()> {
                                             // continue;
                                         }
                                     }
-                                    info!("Submitting batch extrinsics successfully, users num: {}", user_name_record.len());
+                                    debug!("Submitting batch extrinsics successfully, users num: {}", user_name_record.len());
                                 }
                                 Err(e) => {
                                     warn!("Error submitting batch extrinsics for {user_name}: {:?}, try again", e);
@@ -231,7 +297,7 @@ async fn main() -> anyhow::Result<()> {
     }
     join_all(tasks).await;
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // 最后查询一下所有的仓位和挂单
     let api = get_api().await?;
@@ -257,7 +323,7 @@ async fn main() -> anyhow::Result<()> {
 
                     let matched_orders_count = p.base_asset_amount / SIZE_OF_EACH_ORDER;
                     info!(
-                    "[{i}]{:?}  subaccount: {:?}, market_id: {}, is_long {}, total_orders {}, matched_orders {}, pending_orders {}, unknown_orders {}",
+                    "[{i}]{:?}  subaccount: {:?}, market_id: {}, is_long {}, total_orders {}, matched_orders {}, pending_orders {}, cancelled_orders {}",
                     name,
                     subaccount,
                     p.market_id,
@@ -265,7 +331,8 @@ async fn main() -> anyhow::Result<()> {
                     total_order,
                     matched_orders_count,
                     pending_orders_count,
-                    n / 2 - matched_orders_count as u32 - pending_orders_count as u32
+                    total_order as usize - matched_orders_count as usize - pending_orders_count
+                    // n / 2 - matched_orders_count as u32 - pending_orders_count as u32
                 );
                 }
             } else {
@@ -324,7 +391,7 @@ fn build_place_order_pair(market_id: u16, price: u128, account_1: &AccountDetail
             account_1.subaccount,
             market_id,
             true,
-            price - price_diff,
+            price * 9 / 10 - price_diff,
             price,
             OrderType::Limit,
         ),
@@ -334,7 +401,7 @@ fn build_place_order_pair(market_id: u16, price: u128, account_1: &AccountDetail
             account_2.subaccount,
             market_id,
             false,
-            price + price_diff,
+            price * 11 / 10 + price_diff,
             price,
             OrderType::Limit,
         ),
@@ -598,8 +665,8 @@ async fn build_batch_ops(
         n = PENDING_NUM * 2;
     }
     for i in 1..=n {
-        let op = if i % 2 == 1 {
-            debug!("{user_name} subaccount: {subaccount:?} build place order: {} tx with nonce: {nonce} for i: {i}", cancel_id + 1);
+        let op = if MATCHED_PERCENT == 100 {
+            debug!("{user_name} subaccount: {subaccount:?} build place order: {} tx with price: {price} nonce: {nonce} for i: {i}", cancel_id + 1);
             cancel_id += 1;
             let price = target_price(
                 user_name,
@@ -627,24 +694,57 @@ async fn build_batch_ops(
                 })
             )
         } else {
-            if user_name.starts_with("extra_pending_user") {
-                continue;
+            if i % 2 == 1 {
+                debug!("{user_name} subaccount: {subaccount:?} build place order: {} tx with price: {price} nonce: {nonce} for i: {i}", cancel_id + 1);
+                cancel_id += 1;
+                let price = target_price(
+                    user_name,
+                    is_long,
+                    price,
+                    match_price,
+                    cancel_id,
+                    &mut skip_cancel,
+                );
+
+                SingleOperation::Perp(
+                    PerpOperation::Place(PlaceParams {
+                        subaccount,
+                        market_id,
+                        is_long,
+                        size: 10_000,
+                        price,
+                        order_type: order_type.clone(),
+                        slippage: None,
+                        leverage: 2,
+                        take_profit: None,
+                        stop_loss: None,
+                        reduce_only: false,
+                        post_only: PostOnlyParam::None,
+                    })
+                )
+            } else {
+                // if user_name.starts_with("extra_pending_user") {
+                //     continue;
+                // }
+                let order_id = if skip_cancel {
+                    skip_cancel = false;
+                    0 // execute failed
+                    // continue;
+                } else {
+                    i.saturating_sub(cancel_id)
+                };
+                debug!("{user_name} subaccount: {subaccount:?} build cancel order: {order_id} tx with nonce: {nonce} for i: {i}");
+                SingleOperation::Perp(
+                    PerpOperation::Cancel(CancelParams {
+                        subaccount,
+                        order_id,
+                        market_id,
+                        cancel_reason: CancelReason::UserCanceled,
+                    })
+                )
             }
-            if skip_cancel {
-                skip_cancel = false;
-                continue;
-            }
-            let order_id = i.saturating_sub(cancel_id);
-            debug!("{user_name} subaccount: {subaccount:?} build cancel order: {order_id} tx with nonce: {nonce} for i: {i}");
-            SingleOperation::Perp(
-                PerpOperation::Cancel(CancelParams {
-                    subaccount,
-                    order_id,
-                    market_id,
-                    cancel_reason: CancelReason::UserCanceled,
-                })
-            )
         };
+        let op =
 
         ops.push(op);
 
@@ -660,11 +760,148 @@ async fn build_batch_ops(
         }
 
         if encoded_inner.len() * BATCH_OPS_NUM as usize >= chunk_size as usize {
-            info!("{user_name} subaccount: {subaccount:?} send batch_operations call");
+            debug!("{user_name} subaccount: {subaccount:?} send batch_operations call");
 
             pool_sender.send((std::mem::take(&mut encoded_inner), user_name.to_string()))?;
         }
         nonce += 1;
+    }
+    Ok(())
+}
+
+async fn place_extra_pending_orders(
+    user_name: &str,
+    user: &Keypair,
+    subaccount: H160,
+    market_id: u16,
+    is_long: bool,
+    price: u128,
+    match_price: u128,
+    order_type: OrderType,
+    n: u32,
+    rate: u32,
+    index: usize,
+    average_pending: bool,
+) -> anyhow::Result<()> {
+    let api = get_api().await?;
+    let mut nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_millis() as u64;
+
+    let rpc_client = RpcClient::from_url(NODE_WS_ADDR).await?;
+    let rpc = LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client);
+
+    let mut start = Instant::now();
+    let interval_inner = 1000 / rate as u64;
+    let interval = Duration::from_millis(interval_inner.saturating_mul(8) / 10); // 80&
+    let mut next_tick = Instant::now();
+    let mut cancel_id: u32 = 0;
+    // let mut total_encode_inner = Vec::new();
+    let mut encoded_inner = Vec::new();
+    let chunk_size = rate;
+    let mut inner_num: u32 = 0;
+    let mut skip_cancel = false;
+
+    for i in 1..=n {
+        let price = if average_pending {
+            let price_diff = i % (N as u32 * 5 * MARKET_NUM / 2);
+            if is_long {
+                match_price * 9 / 10 - price_diff as u128
+            } else {
+                match_price * 11 / 10 + price_diff as u128
+            }
+        } else {
+            if is_long {
+                match_price - index as u128 - 1 // 排在最前面
+            } else {
+                match_price + index as u128 + 1 // 排在最前面
+            }
+        };
+        let signed_tx_bytes = {
+            debug!("{user_name} extra account build place order: {} tx with price: {price} nonce {nonce} for i: {i}", cancel_id + 1);
+            cancel_id += 1;
+
+            let perp_order = PerpOrder {
+                order_id: cancel_id,
+                owner: subaccount,
+                market_id,
+                is_long,
+                size: 10000,
+                price,
+                order_type: order_type.clone(),
+                create_time: 0,
+                leverage: 10,
+                slippage: None,
+                status: OrderStatus::Open,
+                size_filled: 0,
+                size_remain: 10000,
+                take_profit: None,
+                stop_loss: None,
+                reduce_only: false,
+                post_only: PostOnlyParam::None,
+            };
+            let call = node_runtime::tx().perp_market().append_order_directly(
+                perp_order
+            );
+            //
+            // let call = node_runtime::tx().perp_market().place_order(
+            //     subaccount,
+            //     market_id,
+            //     is_long,
+            //     10_000,
+            //     if is_long {
+            //         match_price - index as u128 - 1 // 排在最前面
+            //     } else {
+            //         match_price + index as u128 + 1 // 排在最前面
+            //     },
+            //     order_type.clone(),
+            //     None,
+            //     2,
+            //     None,
+            //     None,
+            //     false,
+            //     PostOnlyParam::None,
+            // );
+            tokio::time::sleep_until(next_tick.into()).await;
+            next_tick += interval;
+
+            let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
+            let signed_tx = api.tx().create_partial_offline(&call, params)?.sign(user);
+            Bytes::from_owner(signed_tx.into_encoded())
+        };
+        encoded_inner.extend(signed_tx_bytes);
+        inner_num += 1;
+        nonce += 1;
+        if inner_num >= chunk_size {
+            loop {
+                let mut extrinsics = Vec::new();
+                Compact(inner_num).encode_to(&mut extrinsics);
+                extrinsics.extend(encoded_inner.clone());
+                match rpc.author_submit_extrinsics(&extrinsics).await {
+                    Ok(batch_res) => {
+                        for res in batch_res {
+                            if let Err(e) = res {
+                                warn!("Error submitting inner extrinsics for {user_name}: {:?}, try again", e);
+                            }
+                        }
+                        info!("{user_name} Submitting batch extrinsics successfully");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!("Error submitting batch extrinsics for {user_name}: {:?}, try again", e);
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                        continue;
+                    }
+                }
+            }
+            inner_num = 0;
+            encoded_inner = Vec::new();
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+
+            // tokio::time::sleep_until(next_tick.into()).await;
+            next_tick += interval * chunk_size;
+        }
     }
     Ok(())
 }
@@ -1011,7 +1248,7 @@ async fn prepare_env(market_num: u32) -> anyhow::Result<Vec<u16>> {
             &token_name,
             token_address,
             8,
-            "NULL",
+            "USDT",
             usdt_token_address,
             6,
             "quote",
@@ -1298,16 +1535,6 @@ pub async fn create_extra_test_accounts(n: u32) -> anyhow::Result<Vec<AccountDet
         let call = node_runtime::tx().quota().activate_account(
             kp.public_key().to_account_id()
         );
-
-
-        // let _event = client
-        //     .sign_and_submit_then_watch_default(&call, &*ROOTER)
-        //     .await?
-        //     .wait_for_finalized_success()
-        //     .await?
-        //     .find_first::<node_runtime::quota::events::Activate>()?
-        //     .ok_or_else(|| anyhow::anyhow!("Activate event not found"))?;
-
         let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
         let signed_tx = client.tx().create_partial_offline(&call, params)?.sign(&root_kp);
         let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
@@ -1328,14 +1555,6 @@ pub async fn create_extra_test_accounts(n: u32) -> anyhow::Result<Vec<AccountDet
         let call = node_runtime::tx().sudo().sudo(
             tx
         );
-
-        // let _event = client
-        //     .sign_and_submit_then_watch_default(&call, &*ROOTER)
-        //     .await?
-        //     .wait_for_finalized_success()
-        //     .await?
-        //     .find_first::<node_runtime::balances::events::BalanceSet>()?
-        //     .ok_or_else(|| anyhow::anyhow!("BalanceSet event not found"))?;
 
         let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
         let signed_tx = client.tx().create_partial_offline(&call, params)?.sign(&root_kp);
@@ -1373,16 +1592,16 @@ fn target_price(user_name: &str, is_long: bool, pre_price: u128, match_price: u1
     }
     let price = if MATCHED_PERCENT > 0 {
         let trigger_match = 100 / MATCHED_PERCENT;
-        if cancel_id >= 100 {
+        // if cancel_id >= 100 {
             if cancel_id % trigger_match == 0 {
                 *skip_cancel = true;
                 match_price
             } else {
                 pre_price
             }
-        } else {
-            pre_price
-        }
+        // } else {
+        //     pre_price
+        // }
     } else {
         pre_price
     };
