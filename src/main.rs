@@ -56,11 +56,11 @@ const MAX_ACTIVE_ORDERS: u32 = 500000;
 
 const SIZE_OF_EACH_ORDER: u128 = 10_000;
 
-const MATCHED_PERCENT: u32 = 0; // 1%
+const MATCHED_PERCENT: u32 = 1; // 1%
 
-const PENDING_NUM: u32 = 0;
+const PENDING_NUM: u32 = 30000;
 
-const BATCH_OPS_NUM: u32 = 10;
+const BATCH_OPS_NUM: u32 = 1;
 
 const MARKET_NUM: u32 = 1;
 
@@ -121,8 +121,8 @@ async fn main() -> anyhow::Result<()> {
     }
     tokio::time::sleep(Duration::from_millis(5000)).await;
     // let rate = 70; // single thread(full-matched), tps: 6000
-    // let rate = 200; // single thread(non-matched), tps: 50000(200*250(acc))
-    let rate = 570; // single thread(non-matched), batch ops: 112000(56 * 10(ops) * 200(acc))
+    let rate = 400; // single thread(non-matched), tps: 76000(380*200(acc))
+    // let rate = 750; // single thread(non-matched), batch ops(1% matched): 148000(74 * 10(ops) * 200(acc))
     // let rate = 70; // multi thread(5, full-matched), tps: 17500
     // let rate = 200; // multi thread(5, non-matched), tps: 100000(250 * 80(acc) * 5)
 
