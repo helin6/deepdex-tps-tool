@@ -85,6 +85,8 @@ const MARKET_NUM: u32 = 1;
 
 const N: usize = 40;
 
+const INIT_QUOTA: u32 = 429467295;
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -92,7 +94,6 @@ async fn main() -> anyhow::Result<()> {
 
     // 准备订单簿，市场等环境
     let market_ids = prepare_env(MARKET_NUM, false).await?;
-    let init_quota = 429467295;
 
     // 创建额外账户
     // const N: usize = 10;
@@ -1833,8 +1834,9 @@ pub async fn create_extra_test_accounts(n: u32) -> anyhow::Result<Vec<AccountDet
 
         let kp = Keypair::from_phrase(&bip39::Mnemonic::from_str(DEV_PHRASE)?, None, DerivationPath::eth(0, addr_idx))?;
 
-        let call = node_runtime::tx().quota().activate_account(
-            kp.public_key().to_account_id()
+        let call = node_runtime::tx().quota().manager_add_quota(
+            kp.public_key().to_account_id(),
+            INIT_QUOTA
         );
         let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
         let signed_tx = client.tx().create_partial_offline(&call, params)?.sign(&root_kp);
@@ -1849,31 +1851,6 @@ pub async fn create_extra_test_accounts(n: u32) -> anyhow::Result<Vec<AccountDet
             }
         }
 
-        let tx = node_runtime::Call::Balances(node_runtime::balances::Call::force_set_balance {
-            who: kp.public_key().to_account_id(),
-            new_free: 10_000_000_000_000_000_000_000u128.into(),
-        });
-        let call = node_runtime::tx().sudo().sudo(
-            tx
-        );
-
-        let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
-        let signed_tx = client.tx().create_partial_offline(&call, params)?.sign(&root_kp);
-        let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
-        match rpc.author_submit_extrinsic(&call_bytes).await {
-            Ok(_) => {
-                nonce += 1;
-            }
-            Err(e) => {
-                warn!("Error submitting BalanceSet: {e:?}");
-                continue;
-            }
-        }
-        // let name = if i == 1 || i == 2 {
-        //     format!("extra_pending_user{addr_idx}")
-        // } else {
-        //     format!("test_user_{addr_idx}")
-        // };
         let name = format!("test_user_{addr_idx}");
         debug!("[{i}] account init");
         let account_detail = AccountDetail { name, kp, subaccount: Default::default() };
