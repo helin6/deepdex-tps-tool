@@ -85,7 +85,7 @@ const MARKET_NUM: u32 = 1;
 
 const N: usize = 40;
 
-const INIT_QUOTA: u32 = 429467295;
+const INIT_QUOTA: u32 = 4294672;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> anyhow::Result<()> {
@@ -138,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
         let kp = x.kp.clone();
         let subaccount = x.subaccount.clone();
         info!("do deposit by account: {:?} to subaccount: {:?}", hex::encode(&kp.public_key().to_account_id().0), subaccount);
-        deposit(&kp, &subaccount, 1, "USDT", amount).await.unwrap();
+        deposit(&kp, &subaccount, 1, "usdc", amount).await.unwrap();
     }
     tokio::time::sleep(Duration::from_millis(5000)).await;
     // let rate = 70; // single thread(full-matched), tps: 6000
@@ -1829,10 +1829,29 @@ pub async fn create_extra_test_accounts(n: u32) -> anyhow::Result<Vec<AccountDet
     let rpc = LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client);
     let mut nonce = client.tx().account_nonce(&ROOTER.public_key().to_account_id()).await?;
     let root_kp = ROOTER.clone();
-        for i in 1..=n {
+    for i in 1..=n {
         let addr_idx = 1000 + i;
 
         let kp = Keypair::from_phrase(&bip39::Mnemonic::from_str(DEV_PHRASE)?, None, DerivationPath::eth(0, addr_idx))?;
+
+
+
+        let call = node_runtime::tx().quota().activate_account(
+            kp.public_key().to_account_id()
+
+        );
+        let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
+        let signed_tx = client.tx().create_partial_offline(&call, params)?.sign(&root_kp);
+        let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
+        match rpc.author_submit_extrinsic(&call_bytes).await {
+            Ok(_) => {
+                nonce += 1;
+            }
+            Err(e) => {
+                warn!("Error submitting activate_account: {e:?}");
+                continue;
+            }
+        }
 
         let call = node_runtime::tx().quota().manager_add_quota(
             kp.public_key().to_account_id(),
@@ -1846,7 +1865,7 @@ pub async fn create_extra_test_accounts(n: u32) -> anyhow::Result<Vec<AccountDet
                 nonce += 1;
             }
             Err(e) => {
-                warn!("Error submitting activate_account: {e:?}");
+                warn!("Error submitting add quota for account: {e:?}");
                 continue;
             }
         }
