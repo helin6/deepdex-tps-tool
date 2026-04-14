@@ -27,7 +27,7 @@ use subxt_signer::eth::{DerivationPath, Keypair};
 use tokio::time::Instant;
 use tokio::{self};
 use sha3::Digest;
-use tokio::sync::RwLock;
+use tokio::sync::{OnceCell, RwLock};
 
 // subxt metadata --url http://127.0.0.1:9933 --version 14 -f bytes > deepx-node-metadata.scale
 #[subxt::subxt(
@@ -55,7 +55,10 @@ const PERP_CANCEL_ORDER_SELECTOR: [u8; 4] = [247, 106, 0, 107];
 
 const PERP_ADDRESS: [u8; 20] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 78];
 
-const NODE_WS_ADDR: &str = "wss://rpc-testnet.deepx.fi";
+//const NODE_WS_ADDR: &str = "wss://rpc-testnet.deepx.fi";
+const NODE_WS_ADDR: &str = "ws://136.110.109.17:9937";
+static GLOBAL_API: OnceCell<OnlineClient<EthRuntimeConfig>> = OnceCell::const_new();
+static GLOBAL_RPC: OnceCell<RpcClient> = OnceCell::const_new();
 
 // static ROOTER: LazyLock<Keypair> = LazyLock::new(|| dev::alith());
 
@@ -78,7 +81,7 @@ const SIZE_OF_EACH_ORDER: u128 = 10_000;
 const MATCHED_PERCENT: u32 = 1; // 1%
 
 const BATCH_OPS_NUM: u32 = 1;
-const TEST_ACCOUNT_NUM: u32 = 200;
+const TEST_ACCOUNT_NUM: u32 = 20;
 const TEST_MARKET_ID: u16 = 2;
 const PENDING_NUM: u32 = 0;
 const MARKET_NUM: u32 = 1;
@@ -136,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
     }
     tokio::time::sleep(Duration::from_millis(5000)).await;
     // let rate = 70; // single thread(full-matched), tps: 6000
-    let rate = 500; // single thread(1% matched), tps: 80000(450*200(acc))
+    let rate = 50; // single thread(1% matched), tps: 80000(450*200(acc))
     // let rate = 280; // single thread(1% matched, evm), tps: 44000(220*200(acc))
     // let rate = 750; // single thread(non-matched), batch ops(1% matched): 148000(74 * 10(ops) * 200(acc))
     // let rate = 70; // multi thread(5, full-matched), tps: 17500
@@ -159,8 +162,13 @@ async fn main() -> anyhow::Result<()> {
                 let mut inner_num: u32 = 0;
                 let mut call_num: u32 = 0;
 
-                let rpc_client = RpcClient::from_url(NODE_WS_ADDR).await.unwrap();
-                let rpc = LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client);
+                let rpc = match get_rpc().await {
+                    Ok(rpc) => rpc,
+                    Err(e) => {
+                        error!("pool sender init rpc failed: {e}");
+                        return;
+                    }
+                };
                 let pool_rate = total_acc_num as u32 * rate / pool_sender_num;
                 let mut now = std::time::Instant::now();
                 let mut sender_count = 0;
@@ -372,8 +380,17 @@ fn build_place_order_pair(market_id: u16, price: u128, account_1: &AccountDetail
 }
 
 async fn get_api() -> anyhow::Result<OnlineClient<EthRuntimeConfig>> {
-    let api = OnlineClient::<EthRuntimeConfig>::from_url(NODE_WS_ADDR).await?;
-    Ok(api)
+    let api = GLOBAL_API
+        .get_or_try_init(|| async { OnlineClient::<EthRuntimeConfig>::from_insecure_url(NODE_WS_ADDR).await })
+        .await?;
+    Ok(api.clone())
+}
+
+async fn get_rpc() -> anyhow::Result<LegacyRpcMethods<EthRuntimeConfig>> {
+    let rpc_client = GLOBAL_RPC
+        .get_or_try_init(|| async { RpcClient::from_insecure_url(NODE_WS_ADDR).await })
+        .await?;
+    Ok(LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client.clone()))
 }
 
 async fn place_order_no_wait_response_evm_old(
@@ -459,8 +476,7 @@ async fn place_order_no_wait_response_evm_old(
         nonce = nonce + 1;
     }
 
-    let rpc_client = RpcClient::from_url(NODE_WS_ADDR).await?;
-    let rpc = LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client);
+    let rpc = get_rpc().await?;
 
     let mut start = Instant::now();
     let interval = Duration::from_micros(1_000_000 / rate as u64);
@@ -524,8 +540,7 @@ async fn place_order_no_wait_response_evm(
         OrderType::Stop => 2,
     };
 
-    let rpc_client = RpcClient::from_url(NODE_WS_ADDR).await?;
-    let rpc = LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client);
+    let rpc = get_rpc().await?;
 
     let mut start = Instant::now();
     let interval_inner = 1000 / rate as u64;
@@ -664,8 +679,7 @@ async fn place_order_no_wait_response_old_batch(
         .expect("Time went backwards")
         .as_millis() as u64;
 
-    let rpc_client = RpcClient::from_url(NODE_WS_ADDR).await?;
-    let rpc = LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client);
+    let rpc = get_rpc().await?;
 
     let mut start = Instant::now();
     let interval_inner = 1000 / rate as u64;
@@ -763,8 +777,7 @@ async fn build_batch_ops(
         .expect("Time went backwards")
         .as_millis() as u64;
 
-    let rpc_client = RpcClient::from_url(NODE_WS_ADDR).await?;
-    let rpc = LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client);
+    let rpc = get_rpc().await?;
 
     let mut start = Instant::now();
     let interval_inner = 1000 / rate as u64;
@@ -920,8 +933,7 @@ async fn place_extra_pending_orders(
         .expect("Time went backwards")
         .as_millis() as u64;
 
-    let rpc_client = RpcClient::from_url(NODE_WS_ADDR).await?;
-    let rpc = LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client);
+    let rpc = get_rpc().await?;
 
     let mut start = Instant::now();
     let interval_inner = 1000 / rate as u64;
@@ -1038,8 +1050,7 @@ async fn place_order_no_wait_response_old(
         .expect("Time went backwards")
         .as_millis() as u64;
 
-    let rpc_client = RpcClient::from_url(NODE_WS_ADDR).await?;
-    let rpc = LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client);
+    let rpc = get_rpc().await?;
 
     let mut start = Instant::now();
     let interval_inner = 1000 / rate as u64;
@@ -1227,28 +1238,31 @@ async fn get_market_id_by_name(market_name: &str) -> anyhow::Result<u16> {
 
 async fn deposit(kp: &Keypair, subaccount: &H160, market_id: u8, asset: &str, amount: u128) -> anyhow::Result<()> {
     let api = get_api().await?;
+    let rpc = get_rpc().await?;
+    let nonce = api.tx().account_nonce(&kp.public_key().to_account_id()).await?;
 
-    let tx_deposit = node_runtime::tx()
+    let call = node_runtime::tx()
         .lending()
         .deposit(None, *subaccount, market_id, BoundedVec(asset.as_bytes().to_vec()), amount);
+    let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
+    let signed_tx = api.tx().create_partial_offline(&call, params)?.sign(kp);
+    let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
 
-    let events = api
-        .tx()
-        .sign_and_submit_default(&tx_deposit, kp)
-        .await?;
-
-    // let events = api
-    //     .tx()
-    //     .sign_and_submit_then_watch_default(&tx_deposit, kp)
-    //     .await?
-    //     .wait_for_finalized_success()
-    //     .await?;
-
-    // if let Some(event) = events.find_first::<node_runtime::lending::events::Deposit>()? {
-    //     debug!("Deposit success: {}", hex::encode(&event.who.0));
-    // } else {
-    //     return Err(anyhow::anyhow!("Failed to deposit"));
-    // }
+    match rpc.author_submit_extrinsic(&call_bytes).await {
+        Ok(_) => {
+            debug!(
+                "deposit submitted: owner={:?}, subaccount={:?}, market_id={}, asset={}, amount={}",
+                hex::encode(&kp.public_key().to_account_id().0),
+                subaccount,
+                market_id,
+                asset,
+                amount
+            );
+        }
+        Err(e) => {
+            warn!("Failed to deposit for subaccount {:?}: {:?}", subaccount, e);
+        }
+    }
     Ok(())
 }
 
@@ -1260,8 +1274,7 @@ async fn get_first_subaccount_ensure_exist(user: &Keypair, subaccount_name: &str
     let call = node_runtime::tx()
         .subaccount()
         .initialize_subaccount(BoundedVec(subaccount_name.as_bytes().to_vec()));
-    let rpc_client = RpcClient::from_url(NODE_WS_ADDR).await?;
-    let rpc = LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client);
+    let rpc = get_rpc().await?;
     let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
     let signed_tx = api.tx().create_partial_offline(&call, params)?.sign(user);
     let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
@@ -1307,8 +1320,7 @@ async fn prepare_env(market_num: u32, verify_event: bool) -> anyhow::Result<Vec<
     let tx = node_runtime::tx().sudo().sudo(call);
     let api = get_api().await?;
     let mut nonce = api.tx().account_nonce(&ROOTER.public_key().to_account_id()).await?;
-    let rpc_client = RpcClient::from_url(NODE_WS_ADDR).await?;
-    let rpc = LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client);
+    let rpc = get_rpc().await?;
 
     if !verify_event {
         // api
@@ -1476,8 +1488,7 @@ async fn create_spot_market(
         //     .tx()
         //     .sign_and_submit_default(&tx, &*ROOTER)
         //     .await?;
-        let rpc_client = RpcClient::from_url(NODE_WS_ADDR).await?;
-        let rpc = LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client);
+        let rpc = get_rpc().await?;
         let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
         let signed_tx = api.tx().create_partial_offline(&tx, params)?.sign(&*ROOTER);
         let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
@@ -1532,8 +1543,7 @@ async fn create_lending_pool(asset: &str, decimal: u32, initial_asset_weight: u1
         //     .tx()
         //     .sign_and_submit_default(&tx, &*ROOTER)
         //     .await?;
-        let rpc_client = RpcClient::from_url(NODE_WS_ADDR).await?;
-        let rpc = LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client);
+        let rpc = get_rpc().await?;
         let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
         let signed_tx = api.tx().create_partial_offline(&tx, params)?.sign(&*ROOTER);
         let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
@@ -1642,8 +1652,7 @@ async fn create_perp_market(
         // let event = client
         //     .sign_and_submit_default(&tx, &*ROOTER)
         //     .await?;
-        let rpc_client = RpcClient::from_url(NODE_WS_ADDR).await?;
-        let rpc = LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client);
+        let rpc = get_rpc().await?;
         let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
         let signed_tx = api.tx().create_partial_offline(&tx, params)?.sign(&*ROOTER);
         let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
@@ -1671,8 +1680,7 @@ async fn create_perp_market(
         price: oracle_price * 10u128.pow(12),
     });
     let tx = node_runtime::tx().sudo().sudo(call);
-    let rpc_client = RpcClient::from_url(NODE_WS_ADDR).await?;
-    let rpc = LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client);
+    let rpc = get_rpc().await?;
     let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce + 1).build();
     let signed_tx = api.tx().create_partial_offline(&tx, params)?.sign(&*ROOTER);
     let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
@@ -1761,8 +1769,7 @@ pub async fn create_extra_test_accounts(n: u32) -> anyhow::Result<Vec<AccountDet
     let mut result = Vec::new();
     let mut client = get_api()
         .await?;
-    let rpc_client = RpcClient::from_url(NODE_WS_ADDR).await?;
-    let rpc = LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client);
+    let rpc = get_rpc().await?;
     let mut nonce = client.tx().account_nonce(&ROOTER.public_key().to_account_id()).await?;
     let root_kp = ROOTER.clone();
         for i in 1..=n {
@@ -1808,6 +1815,7 @@ pub async fn create_extra_test_accounts(n: u32) -> anyhow::Result<Vec<AccountDet
         
         let name = format!("test_user_{addr_idx}");
         debug!("[{i}] account init");
+        debug!("[{i}] atccoun init, address: {:?}", hex::encode(&kp.public_key().to_account_id().0));
         let account_detail = AccountDetail { name, kp, subaccount: Default::default() };
         result.push(account_detail);
     }
