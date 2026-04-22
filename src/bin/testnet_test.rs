@@ -78,14 +78,16 @@ const MAX_ACTIVE_ORDERS: u32 = 500000;
 
 const SIZE_OF_EACH_ORDER: u128 = 10_000;
 
-const MATCHED_PERCENT: u32 = 1; // 1%
+const MATCHED_PERCENT: u32 = 0; // 1%
 
 const BATCH_OPS_NUM: u32 = 1;
 const TEST_ACCOUNT_NUM: u32 = 20;
-const TEST_MARKET_ID: u16 = 2;
+const TEST_MARKET_ID: u16 = 3;
 const PENDING_NUM: u32 = 0;
 const MARKET_NUM: u32 = 1;
 const INIT_QUOTA: u32 = 429467295;
+
+const ORDER_SIZE: u128 = 1000000000000000;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> anyhow::Result<()> {
@@ -102,18 +104,20 @@ async fn main() -> anyhow::Result<()> {
     info!("create subaccounts......");
 
     // 创建子账户
-    for x in test_accounts.iter() {
-        let x = x.clone();
-        let _ = get_first_subaccount_ensure_exist(&x.kp, x.name.as_str()).await;
-    }
-
-    tokio::time::sleep(Duration::from_millis(10000)).await;
+    // for x in test_accounts.iter() {
+    //     let x = x.clone();
+    //     let _ = get_first_subaccount_ensure_exist(&x.kp, x.name.as_str()).await;
+    // }
+    //
+    // tokio::time::sleep(Duration::from_millis(10000)).await;
 
     for x in test_accounts.iter_mut() {
         if let Ok(subaccounts) = get_subaccount(&x.kp).await {
             if let Some(subaccount) = subaccounts.get(0) {
-                info!("find subaccount: {:?}", subaccount);
-                let account_detail = AccountDetail { name: x.name.clone(), kp: x.kp.clone(), subaccount: subaccount.clone() };
+                let subaccount_info_query = node_runtime::storage().subaccount().subaccount_info(subaccount.clone());
+                let subaccount_info = get_api().await?.storage().at_latest().await?.fetch(&subaccount_info_query).await?.unwrap();
+                let account_detail = AccountDetail { name: x.name.clone(), kp: x.kp.clone(), subaccount: subaccount.clone(), order_num: subaccount_info.next_order_id.saturating_sub(1) };
+                info!("find subaccount: {:?} with init order num: {}", subaccount, subaccount_info.next_order_id.saturating_sub(1));
                 *x = account_detail;
             } else {
                 warn!("subaccount not find for {:?}", x.name);
@@ -123,23 +127,63 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    tokio::time::sleep(Duration::from_millis(10000)).await;
+
+    // clear pre positions
+    for x in &test_accounts {
+        clear_exist_positions(x).await.unwrap();
+    }
+
+    tokio::time::sleep(Duration::from_millis(10000)).await;
+
+    for x in &test_accounts {
+        loop {
+            if let Err(e) = check_exist_pos(x).await {
+                warn!("waiting for closing: {:?}, subaccount: {:?}", e, x.subaccount);
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+            } else {
+                break;
+            }
+        }
+    }
+    info!("close all positions");
+
+    for x in &test_accounts {
+        cancel_pre_orders(x).await.unwrap();
+    }
+
+    tokio::time::sleep(Duration::from_millis(5000)).await;
+
+
     // 子账户存款
     let amount = 100_000_000u128;
 
     // 由 ROOTER 统一给测试子账户注入 usdc 抵押，避免测试账户自身无 usdc 导致 deposit 失败
     let root_kp = ROOTER.clone();
+    let api = get_api().await?;
+    let mut nonce = api.tx().account_nonce(&root_kp.public_key().to_account_id()).await?;
+
     for x in &test_accounts {
         let subaccount = x.subaccount.clone();
+        if check_deposit(x).await.unwrap() {
+            info!(
+                "skip deposit for subaccount: {:?}",
+                subaccount
+            );
+            continue;
+        }
         info!(
             "do deposit by ROOTER: {:?} to subaccount: {:?}",
             hex::encode(&root_kp.public_key().to_account_id().0),
             subaccount
         );
-        deposit(&root_kp, &subaccount, 1, "usdc", amount).await.unwrap();
+        deposit(&root_kp, &subaccount, 1, "usdc", amount, &mut nonce).await.unwrap();
     }
+
     tokio::time::sleep(Duration::from_millis(5000)).await;
+
     // let rate = 70; // single thread(full-matched), tps: 6000
-    let rate = 50; // single thread(1% matched), tps: 80000(450*200(acc))
+    let rate = 100; // single thread(1% matched), tps: 80000(450*200(acc))
     // let rate = 280; // single thread(1% matched, evm), tps: 44000(220*200(acc))
     // let rate = 750; // single thread(non-matched), batch ops(1% matched): 148000(74 * 10(ops) * 200(acc))
     // let rate = 70; // multi thread(5, full-matched), tps: 17500
@@ -195,9 +239,9 @@ async fn main() -> anyhow::Result<()> {
                             let mut extrinsics = Vec::new();
                             Compact(call_num).encode_to(&mut extrinsics);
                             extrinsics.extend(encoded_inner.clone());
-                            if now.elapsed() < Duration::from_secs(1) {
-                                tokio::time::sleep(Duration::from_secs(1) - now.elapsed()).await;
-                            }
+                            // if now.elapsed() < Duration::from_secs(1) {
+                            //     tokio::time::sleep(Duration::from_secs(1) - now.elapsed()).await;
+                            // }
                             now = std::time::Instant::now();
                             match rpc.author_submit_extrinsics(&extrinsics).await {
                                 Ok(batch_res) => {
@@ -208,7 +252,7 @@ async fn main() -> anyhow::Result<()> {
                                             // continue;
                                         }
                                     }
-                                    debug!("Submitting batch extrinsics successfully, users num: {}", user_name_record.len());
+                                    debug!("{user_name:?} Submitting batch extrinsics successfully, users num: {}", user_name_record.len());
                                 }
                                 Err(e) => {
                                     warn!("Error submitting batch extrinsics for {user_name}: {:?}, try again", e);
@@ -225,9 +269,9 @@ async fn main() -> anyhow::Result<()> {
             tasks.push(pool_task);
             sender
         }).collect();
-    // let place_order_func = place_order_no_wait_response_old_batch;
+    let place_order_func = place_order_no_wait_response_old_batch;
     // let place_order_func = place_order_no_wait_response_evm;
-    let place_order_func = build_batch_ops;
+    // let place_order_func = build_batch_ops;
     let api = get_api().await?;
 
     let mut all_place_order_stubs = Vec::new();
@@ -237,7 +281,12 @@ async fn main() -> anyhow::Result<()> {
         {
             *EXPECT_ACCOUNT_NUM.write().await = test_accounts.len();
         }
-        let market_mark = load_mark_price(&api, *id).await?;
+        let mut market_mark = load_mark_price(&api, *id).await?;
+        let mod_remainder = market_mark
+            .checked_rem_euclid(100000).unwrap();
+        market_mark = market_mark.saturating_sub(mod_remainder);
+        info!("mark price after prune: {market_mark}");
+
         push_order_pairs_for_market(&mut place_order_stubs, test_accounts, *id, market_mark, index)?;
         all_place_order_stubs.push(place_order_stubs.clone());
         let tx_senders = tx_senders.clone();
@@ -268,7 +317,7 @@ async fn main() -> anyhow::Result<()> {
     }
     join_all(tasks).await;
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // 最后查询一下所有的仓位和挂单
     let api = get_api().await?;
@@ -281,49 +330,47 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 0
             };
-
+            let pre_ord_num = test_accounts.iter().find(|v| &v.subaccount == subaccount).map(|v| v.order_num).unwrap_or_default();
+            let ord_increase_num = total_order.saturating_sub(pre_ord_num);
             let position_query = node_runtime::storage().perp_market().user_perp_positions(subaccount.clone());
-            let positions = api.storage().at_latest().await?.fetch(&position_query).await?;
-            if let Some(positions) = positions {
-                for p in positions {
-                    let orders_query = node_runtime::storage()
-                        .perp_market()
-                        .active_perp_orders_for(subaccount.clone());
-                    let orders = api.storage().at_latest().await?.fetch(&orders_query).await?;
-                    let pending_orders_count = if let Some(orders) = orders { orders.iter().map(|v| v.1.len()).sum() } else { 0 };
+            let positions = api.storage().at_latest().await?.fetch(&position_query).await?.unwrap_or_default();
+            if let Some(p) = positions.iter().find(|v| v.market_id == TEST_MARKET_ID) {
+                let orders_query = node_runtime::storage()
+                    .perp_market()
+                    .active_perp_orders_for(subaccount.clone());
+                let orders = api.storage().at_latest().await?.fetch(&orders_query).await?;
+                let pending_orders_count = if let Some(orders) = orders { orders.iter().filter(|v| v.0 == TEST_MARKET_ID).map(|v| v.1.len()).sum() } else { 0 };
 
-                    let matched_orders_count = p.base_asset_amount / SIZE_OF_EACH_ORDER;
-                    info!(
+                let matched_orders_count = p.base_asset_amount / ORDER_SIZE;
+                info!(
                     "[{i}]{:?}  subaccount: {:?}, market_id: {}, is_long {}, total_orders {}, matched_orders {}, pending_orders {}, cancelled_orders {}",
                     name,
                     subaccount,
                     p.market_id,
                     p.is_long,
-                    total_order,
+                    ord_increase_num,
                     matched_orders_count,
                     pending_orders_count,
-                    total_order as usize - matched_orders_count as usize - pending_orders_count
-                    // n / 2 - matched_orders_count as u32 - pending_orders_count as u32
+                    ord_increase_num as usize - pending_orders_count - matched_orders_count as usize
                 );
-                }
             } else {
                 warn!("[{i}]{:?}, no positions found", name);
                 let orders_query = node_runtime::storage()
                     .perp_market()
                     .active_perp_orders_for(subaccount.clone());
                 let orders = api.storage().at_latest().await?.fetch(&orders_query).await?;
-                let pending_orders_count = if let Some(orders) = orders { orders.iter().map(|v| v.1.len()).sum() } else { 0 };
+                let pending_orders_count = if let Some(orders) = orders { orders.iter().filter(|v| v.0 == TEST_MARKET_ID).map(|v| v.1.len()).sum() } else { 0 };
                 info!(
-                "[{i}]{}, subaccount: {:?}, market_id: {}, is_long {}, total_orders {}, matched_orders {}, pending_orders {}, cancelled_orders {}",
-                name,
-                subaccount,
-                market_id,
-                is_long,
-                total_order,
-                0,
-                pending_orders_count,
-                total_order as usize - pending_orders_count
-            );
+                    "[{i}]{}, subaccount: {:?}, market_id: {}, is_long {}, total_orders {}, matched_orders {}, pending_orders {}, cancelled_orders {}",
+                    name,
+                    subaccount,
+                    market_id,
+                    is_long,
+                    ord_increase_num,
+                    0,
+                    pending_orders_count,
+                    ord_increase_num as usize - pending_orders_count
+                );
             }
         }
 
@@ -339,13 +386,14 @@ fn push_order_pairs_for_market(
     price: u128,
     i: usize,
 ) -> anyhow::Result<()> {
-    let mut price_diff = 1;
+    let tick_step = 10000;
+    let mut price_diff = tick_step;
     for chunk in test_accounts.chunks(2) {
         if let [account_1, account_2] = chunk {
             let (t1, t2) = build_place_order_pair(market_id, price, account_1, account_2, price_diff);
             stubs.push(t1);
             stubs.push(t2);
-            price_diff += 1;
+            price_diff += tick_step;
         } else {
             return Err(anyhow::anyhow!("place_order_stubs market:{} test_accounts failed", i));
         }
@@ -362,7 +410,7 @@ fn build_place_order_pair(market_id: u16, price: u128, account_1: &AccountDetail
             account_1.subaccount,
             market_id,
             true,
-            price * 9 / 10 - price_diff,
+            price - price_diff,
             price,
             OrderType::Limit,
         ),
@@ -372,7 +420,7 @@ fn build_place_order_pair(market_id: u16, price: u128, account_1: &AccountDetail
             account_2.subaccount,
             market_id,
             false,
-            price * 11 / 10 + price_diff,
+            price + price_diff,
             price,
             OrderType::Limit,
         ),
@@ -685,7 +733,13 @@ async fn place_order_no_wait_response_old_batch(
     let interval_inner = 1000 / rate as u64;
     let interval = Duration::from_millis(interval_inner.saturating_mul(8) / 10); // 80&
     let mut next_tick = Instant::now();
-    let mut cancel_id: u32 = 0;
+    let subaccount_info_query = node_runtime::storage().subaccount().subaccount_info(subaccount.clone());
+    let subaccount_info = api.storage().at_latest().await?.fetch(&subaccount_info_query).await?;
+    let mut cancel_id = if let Some(info) = subaccount_info {
+        info.next_order_id
+    } else {
+        0
+    };
     // let mut total_encode_inner = Vec::new();
     let mut encoded_inner = Vec::new();
     let chunk_size = rate;
@@ -711,7 +765,7 @@ async fn place_order_no_wait_response_old_batch(
                 subaccount,
                 market_id,
                 is_long,
-                10_000,
+                ORDER_SIZE,
                 price,
                 order_type.clone(),
                 None,
@@ -726,14 +780,7 @@ async fn place_order_no_wait_response_old_batch(
             let signed_tx = api.tx().create_partial_offline(&call, params)?.sign(user);
             Bytes::from_owner(signed_tx.into_encoded())
         } else {
-            if user_name.starts_with("extra_pending_user") {
-                continue;
-            }
-            if skip_cancel {
-                skip_cancel = false;
-                continue;
-            }
-            let order_id = i.saturating_sub(cancel_id);
+            let order_id = cancel_id.saturating_sub(1);
             debug!("{user_name} subaccount: {subaccount:?} build cancel order: {order_id} tx with nonce: {nonce} for i: {i}");
             let call = node_runtime::tx().perp_market().cancel_order(
                 subaccount,
@@ -746,14 +793,34 @@ async fn place_order_no_wait_response_old_batch(
             let signed_tx = api.tx().create_partial_offline(&call, params)?.sign(user);
             Bytes::from_owner(signed_tx.into_encoded())
         };
-
-
         encoded_inner.push(signed_tx_bytes);
-        if encoded_inner.len() >= chunk_size as usize {
-            pool_sender.send((std::mem::take(&mut encoded_inner), user_name.to_string()))?;
-        }
         nonce += 1;
     }
+
+    info!("{user_name} subaccount: {subaccount:?} build tx finished");
+    {
+        *READY_ACCOUNT_NUM.write().await += 1;
+    }
+    // waiting for all accounts finish building task
+    let expect_accounts_num = *EXPECT_ACCOUNT_NUM.read().await;
+    loop {
+        if *READY_ACCOUNT_NUM.read().await == expect_accounts_num {
+            info!("{user_name} subaccount: {subaccount:?} try to send tx");
+            break;
+        } else {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+    }
+    let mut tx_iter = encoded_inner.chunks(chunk_size as usize);
+    loop {
+        if let Some(encoded_inner) = tx_iter.next() {
+            pool_sender.send((encoded_inner.to_vec(), user_name.to_string()))?;
+        } else {
+            info!("{user_name} subaccount: {subaccount:?} send tx finished");
+            break;
+        }
+    }
+
     Ok(())
 }
 
@@ -783,7 +850,15 @@ async fn build_batch_ops(
     let interval_inner = 1000 / rate as u64;
     let interval = Duration::from_millis(interval_inner.saturating_mul(8) / 10); // 80&
     let mut next_tick = Instant::now();
-    let mut cancel_id: u32 = 0;
+    // let mut cancel_id: u32 = 0;
+    let subaccount_info_query = node_runtime::storage().subaccount().subaccount_info(subaccount.clone());
+    let subaccount_info = api.storage().at_latest().await?.fetch(&subaccount_info_query).await?;
+    let mut cancel_id = if let Some(info) = subaccount_info {
+        info.next_order_id
+    } else {
+        0
+    };
+
     // let mut total_encode_inner = Vec::new();
     let mut encoded_inner = Vec::new();
     let mut ops = Vec::new();
@@ -809,7 +884,7 @@ async fn build_batch_ops(
                     subaccount,
                     market_id,
                     is_long,
-                    size: 10_000,
+                    size: ORDER_SIZE,
                     price,
                     order_type: order_type.clone(),
                     slippage: None,
@@ -838,7 +913,7 @@ async fn build_batch_ops(
                         subaccount,
                         market_id,
                         is_long,
-                        size: 10_000,
+                        size: ORDER_SIZE,
                         price,
                         order_type: order_type.clone(),
                         slippage: None,
@@ -1236,15 +1311,14 @@ async fn get_market_id_by_name(market_name: &str) -> anyhow::Result<u16> {
     Err(anyhow::anyhow!("market not found"))
 }
 
-async fn deposit(kp: &Keypair, subaccount: &H160, market_id: u8, asset: &str, amount: u128) -> anyhow::Result<()> {
+async fn deposit(kp: &Keypair, subaccount: &H160, market_id: u8, asset: &str, amount: u128, nonce: &mut u64) -> anyhow::Result<()> {
     let api = get_api().await?;
     let rpc = get_rpc().await?;
-    let nonce = api.tx().account_nonce(&kp.public_key().to_account_id()).await?;
 
     let call = node_runtime::tx()
         .lending()
         .deposit(None, *subaccount, market_id, BoundedVec(asset.as_bytes().to_vec()), amount);
-    let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
+    let params = SubstrateExtrinsicParamsBuilder::new().nonce(*nonce).build();
     let signed_tx = api.tx().create_partial_offline(&call, params)?.sign(kp);
     let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
 
@@ -1258,6 +1332,7 @@ async fn deposit(kp: &Keypair, subaccount: &H160, market_id: u8, asset: &str, am
                 asset,
                 amount
             );
+            *nonce += 2;
         }
         Err(e) => {
             warn!("Failed to deposit for subaccount {:?}: {:?}", subaccount, e);
@@ -1267,8 +1342,6 @@ async fn deposit(kp: &Keypair, subaccount: &H160, market_id: u8, asset: &str, am
 }
 
 async fn get_first_subaccount_ensure_exist(user: &Keypair, subaccount_name: &str) -> anyhow::Result<H160> {
-
-
     let api = get_api().await?;
     let mut nonce = api.tx().account_nonce(&user.public_key().to_account_id()).await?;
     let call = node_runtime::tx()
@@ -1305,6 +1378,118 @@ async fn get_first_subaccount_ensure_exist(user: &Keypair, subaccount_name: &str
     // } else {
     //     Err(anyhow::anyhow!("Failed to create subaccount"))
     // }
+}
+
+async fn clear_exist_positions(account: &AccountDetail) -> anyhow::Result<()> {
+    let api = get_api().await?;
+
+    let position_query = node_runtime::storage().perp_market().user_perp_positions(account.subaccount.clone());
+    let positions = api.storage().at_latest().await?.fetch(&position_query).await?;
+    if let Some(positions) = positions {
+        let mut nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis() as u64;
+
+        for p in positions {
+            if p.market_id != TEST_MARKET_ID {
+                continue;
+            }
+            info!("subaccount: {:?} close perp position for market: {}", account.subaccount, p.market_id);
+            let call = node_runtime::tx()
+                .perp_market()
+                .close_position(
+                    account.subaccount.clone(),
+                    TEST_MARKET_ID,
+                    0,
+                    None,
+                );
+            let rpc = get_rpc().await?;
+            let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
+            let signed_tx = api.tx().create_partial_offline(&call, params)?.sign(&account.kp);
+            let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
+            match rpc.author_submit_extrinsic(&call_bytes).await {
+                Ok(_) => {
+                    debug!("close perp position success: {}", account.subaccount);
+                    nonce += 1;
+                }
+                Err(e) => {
+                    warn!("Failed to close perp position");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn check_exist_pos(account: &AccountDetail) ->anyhow::Result<()> {
+    let api = get_api().await?;
+    let position_query = node_runtime::storage().perp_market().user_perp_positions(account.subaccount.clone());
+    let positions = api.storage().at_latest().await?.fetch(&position_query).await?;
+    if let Some(positions) = positions {
+        for pos in positions {
+            if pos.market_id != TEST_MARKET_ID {
+                continue;
+            }
+            return Err(anyhow::anyhow!("find target pos"));
+        }
+    }
+    Ok(())
+}
+
+
+async fn check_deposit(account: &AccountDetail) ->anyhow::Result<bool> {
+    let api = get_api().await?;
+    let position_query = node_runtime::storage().lending().positions_for(AccountId20 {0: account.subaccount.clone().0}, 1);
+    let positions = api.storage().at_latest().await?.fetch(&position_query).await?;
+    let skip_deposit = if let Some(positions) = positions {
+        if !positions.deposits.is_empty() {
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    Ok(skip_deposit)
+}
+
+async fn cancel_pre_orders(account: &AccountDetail) ->anyhow::Result<()> {
+    let api = get_api().await?;
+    let orders_query = node_runtime::storage().perp_market().active_perp_orders_for(account.subaccount.clone());
+    let res = api.storage().at_latest().await?.fetch(&orders_query).await?;
+    let rpc = get_rpc().await?;
+    if let Some(res) = res {
+        let mut nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis() as u64;
+        for (id, ords) in res {
+            for ord in ords {
+                let call = node_runtime::tx().perp_market().cancel_order(
+                    account.subaccount,
+                    ord.order_id,
+                    id,
+                    CancelReason::UserCanceled,
+                );
+
+                let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
+                let signed_tx = api.tx().create_partial_offline(&call, params)?.sign(&account.kp);
+                let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
+                match rpc.author_submit_extrinsic(&call_bytes).await {
+                    Ok(_) => {
+                        info!("{:?} cancel_pre_order {} success", account.subaccount, ord.order_id);
+                        nonce += 1;
+                    }
+                    Err(e) => {
+                        warn!("Failed to cancel_pre_orders");
+                    }
+                }
+            }
+
+        }
+    }
+    Ok(())
 }
 
 async fn prepare_env(market_num: u32, verify_event: bool) -> anyhow::Result<Vec<u16>> {
@@ -1776,47 +1961,46 @@ pub async fn create_extra_test_accounts(n: u32) -> anyhow::Result<Vec<AccountDet
         let addr_idx = 1000 + i;
 
         let kp = Keypair::from_phrase(&bip39::Mnemonic::from_str(DEV_PHRASE)?, None, DerivationPath::eth(0, addr_idx))?;
+        //
+        // let call = node_runtime::tx().quota().activate_account(
+        //     kp.public_key().to_account_id()
+        //
+        // );
+        // let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
+        // let signed_tx = client.tx().create_partial_offline(&call, params)?.sign(&root_kp);
+        // let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
+        // match rpc.author_submit_extrinsic(&call_bytes).await {
+        //     Ok(_) => {
+        //         nonce += 1;
+        //     }
+        //     Err(e) => {
+        //         warn!("Error submitting activate_account: {e:?}");
+        //         continue;
+        //     }
+        // }
+        //
+        //
+        // let call = node_runtime::tx().quota().manager_add_quota(
+        //     kp.public_key().to_account_id(),
+        //     INIT_QUOTA
+        // );
+        // let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
+        // let signed_tx = client.tx().create_partial_offline(&call, params)?.sign(&root_kp);
+        // let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
+        // match rpc.author_submit_extrinsic(&call_bytes).await {
+        //     Ok(_) => {
+        //         nonce += 1;
+        //     }
+        //     Err(e) => {
+        //         warn!("Error submitting activate_account: {e:?}");
+        //         continue;
+        //     }
+        // }
 
-        let call = node_runtime::tx().quota().activate_account(
-            kp.public_key().to_account_id()
 
-        );
-        let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
-        let signed_tx = client.tx().create_partial_offline(&call, params)?.sign(&root_kp);
-        let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
-        match rpc.author_submit_extrinsic(&call_bytes).await {
-            Ok(_) => {
-                nonce += 1;
-            }
-            Err(e) => {
-                warn!("Error submitting activate_account: {e:?}");
-                continue;
-            }
-        }
-
-
-        let call = node_runtime::tx().quota().manager_add_quota(
-            kp.public_key().to_account_id(),
-            INIT_QUOTA
-        );
-        let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
-        let signed_tx = client.tx().create_partial_offline(&call, params)?.sign(&root_kp);
-        let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
-        match rpc.author_submit_extrinsic(&call_bytes).await {
-            Ok(_) => {
-                nonce += 1;
-            }
-            Err(e) => {
-                warn!("Error submitting activate_account: {e:?}");
-                continue;
-            }
-        }
-
-        
         let name = format!("test_user_{addr_idx}");
-        debug!("[{i}] account init");
         debug!("[{i}] atccoun init, address: {:?}", hex::encode(&kp.public_key().to_account_id().0));
-        let account_detail = AccountDetail { name, kp, subaccount: Default::default() };
+        let account_detail = AccountDetail { name, kp, subaccount: Default::default(), order_num: 0 };
         result.push(account_detail);
     }
 
@@ -1861,10 +2045,11 @@ pub struct AccountDetail {
     name: String,
     kp: Keypair,
     subaccount: H160,
+    order_num: u32,
 }
 
 impl AccountDetail {
-    pub fn new(name: String, kp: Keypair, subaccount: H160) -> Self {
-        Self { name, kp, subaccount }
+    pub fn new(name: String, kp: Keypair, subaccount: H160, order_num: u32) -> Self {
+        Self { name, kp, subaccount, order_num }
     }
 }
