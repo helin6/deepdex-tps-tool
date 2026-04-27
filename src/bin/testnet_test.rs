@@ -239,9 +239,9 @@ async fn main() -> anyhow::Result<()> {
                             let mut extrinsics = Vec::new();
                             Compact(call_num).encode_to(&mut extrinsics);
                             extrinsics.extend(encoded_inner.clone());
-                            // if now.elapsed() < Duration::from_secs(1) {
-                            //     tokio::time::sleep(Duration::from_secs(1) - now.elapsed()).await;
-                            // }
+                            if now.elapsed() < Duration::from_secs(1) {
+                                tokio::time::sleep(Duration::from_secs(1) - now.elapsed()).await;
+                            }
                             now = std::time::Instant::now();
                             match rpc.author_submit_extrinsics(&extrinsics).await {
                                 Ok(batch_res) => {
