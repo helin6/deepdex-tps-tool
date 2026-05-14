@@ -1,0 +1,18 @@
+# 示例：镜像与每台环境分离。
+# 使用：在各机器准备自己的 `.env`（或 `shard-a.env`），然后：
+#   docker compose run --rm bench
+# 或覆盖命令：
+#   docker compose run --rm bench perp_bench
+#
+# 默认 `env_file: .env` 指向 compose 当前目录下的文件；每台机器可换成自己的路径或改用 `environment:`。
+
+services:
+  bench:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: deepdex-tps-tool:local
+    env_file:
+      - .env
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
