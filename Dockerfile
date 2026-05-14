@@ -1,21 +1,28 @@
 # deepdex-tps-tool（subtx-test）镜像
 #
-# 原理简述：
-# 1. 多阶段构建：builder 阶段用 Rust 工具链编译；最终镜像只带 Debian slim + 二进制 + CA 证书，体积小。
-# 2. 配置与镜像分离：不要把各机 `.env` bake 进镜像；运行时用 `docker run --env-file`、`-e` 或 `ENV_FILE` 挂载路径。
-# 3. `ShardRunConfig::load`：若设 `ENV_FILE` 则读该文件；否则尝试当前工作目录 `.env`（与 dotenvy 行为一致）。
+# 必须使用 BuildKit（否则不支持 `--mount=type=secret`，且会退回 legacy builder）：
+#   export DOCKER_BUILDKIT=1
+#   # 或一次性：
+#   DOCKER_BUILDKIT=1 docker build ...
 #
-# 构建（仓库根目录需含 `deepx-node-metadata.scale`，与本地 `cargo build` 相同）：
-#   docker build -t deepdex-tps-tool:local .
+# 若 Cargo 依赖 GitHub **私有** HTTPS 仓库，须注入只读 PAT（勿提交到 Git）：
+#   1) 创建 $HOME/.docker-github-netrc（chmod 600），内容：
+#        machine github.com
+#        login x-access-token
+#        password ghp_你的PAT
+#   2) 构建：
+#        DOCKER_BUILDKIT=1 docker build \
+#          --secret id=git_netrc,src=$HOME/.docker-github-netrc \
+#          -t deepdex-tps-tool:local .
 #
-# 若依赖私有 git，构建机需能访问 Git（示例：用系统 git + 本机凭据）：
-#   docker build --build-arg CARGO_NET_GIT_FETCH_WITH_CLI=true -t deepdex-tps-tool:local .
+# 未传 --secret 时仍可构建（仅当所有 git 依赖均为公开可读）；私有库不传会报
+# `could not read Username` 或 `revision ... not found`（多为未拉到私有提交）。
 #
-# 运行示例（每台机器自己的 env 文件）：
-#   docker run --rm --env-file /path/to/that-host.env deepdex-tps-tool:local perp_bench_fence
-#   docker run --rm -e ENV_FILE=/config/.env -v /opt/secrets/tps.env:/config/.env:ro deepdex-tps-tool:local perp_bench
+# 服务器长期开启 BuildKit（Ubuntu）：在 /etc/docker/daemon.json 增加
+#   { "features": { "buildkit": true } }
+# 然后 sudo systemctl restart docker
 #
-# 可用二进制：perp_bench_fence perp_bench rooter_deposit testnet_test subtx-test（默认 main）
+# 运行示例：docker run --rm --env-file ./.env deepdex-tps-tool:local perp_bench_fence
 
 # syntax=docker/dockerfile:1
 ARG RUST_VERSION=1
@@ -33,7 +40,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY deepx-node-metadata.scale ./
 COPY src ./src
 
-RUN cargo build --locked --release
+# 私有 GitHub：传 --secret id=git_netrc,...；git/cargo 会读 /root/.netrc
+RUN --mount=type=secret,id=git_netrc,target=/root/.netrc,required=false \
+    cargo build --locked --release
 
 FROM docker.io/library/debian:bookworm-slim AS runtime
 
@@ -50,5 +59,4 @@ COPY --from=builder /build/target/release/rooter_deposit /usr/local/bin/
 COPY --from=builder /build/target/release/testnet_test /usr/local/bin/
 COPY --from=builder /build/target/release/subtx-test /usr/local/bin/
 
-# 默认入口可覆盖：`docker run ... perp_bench`
 CMD ["perp_bench_fence"]

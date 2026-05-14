@@ -5,6 +5,9 @@
 #   docker compose run --rm bench perp_bench
 #
 # 默认 `env_file: .env` 指向 compose 当前目录下的文件；每台机器可换成自己的路径或改用 `environment:`。
+#
+# 私有 GitHub 依赖：准备本目录 .docker-github-netrc（chmod 600，格式见 Dockerfile 头），然后：
+#   DOCKER_BUILDKIT=1 docker compose build --secret id=git_netrc,src=.docker-github-netrc
 
 services:
   bench:
