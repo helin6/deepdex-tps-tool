@@ -1446,8 +1446,8 @@ dependencies = [
  "frame-support",
  "parity-scale-codec",
  "scale-info",
- "sp-core",
- "sp-std",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
 ]
 
 [[package]]
@@ -1535,11 +1535,11 @@ dependencies = [
  "parity-scale-codec",
  "scale-info",
  "serde",
- "sp-core",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-io",
  "sp-runtime",
- "sp-runtime-interface",
- "sp-std",
+ "sp-runtime-interface 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
 ]
 
 [[package]]
@@ -1552,9 +1552,9 @@ dependencies = [
  "parity-scale-codec",
  "scale-info",
  "serde",
- "sp-core",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-runtime",
- "sp-std",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
 ]
 
 [[package]]
@@ -1573,12 +1573,12 @@ dependencies = [
  "serde",
  "sp-api",
  "sp-application-crypto",
- "sp-core",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-io",
  "sp-runtime",
- "sp-runtime-interface",
- "sp-std",
- "sp-storage",
+ "sp-runtime-interface 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-storage 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "static_assertions",
 ]
 
@@ -1643,16 +1643,16 @@ dependencies = [
  "smallvec",
  "sp-api",
  "sp-arithmetic",
- "sp-core",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-core-hashing-proc-macro",
- "sp-debug-derive",
+ "sp-debug-derive 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-inherents",
  "sp-io",
  "sp-runtime",
  "sp-staking",
- "sp-state-machine",
- "sp-std",
- "sp-tracing",
+ "sp-state-machine 0.13.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-tracing 6.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-weights",
  "tt-call",
 ]
@@ -1707,10 +1707,10 @@ dependencies = [
  "parity-scale-codec",
  "scale-info",
  "serde",
- "sp-core",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-io",
  "sp-runtime",
- "sp-std",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-timestamp",
  "sp-version",
  "sp-weights",
@@ -2539,6 +2539,18 @@ dependencies = [
 [[package]]
 name = "kv-db"
 version = "0.1.0"
+source = "git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main#70c95bfde0a5797a955e872fcdeaad880a3e6874"
+dependencies = [
+ "hash-db 0.16.0",
+ "log",
+ "memory-db",
+ "rustc-hex",
+ "typed-cache 0.1.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+]
+
+[[package]]
+name = "kv-db"
+version = "0.1.0"
 source = "git+https://github.com/deepdexfinance/polkadot-sdk-par#02668a45e156a3dd032aacddf1aa2de8d52f3dc2"
 dependencies = [
  "hash-db 0.16.0",
@@ -2999,10 +3011,10 @@ dependencies = [
  "parity-scale-codec",
  "rlp",
  "scale-info",
- "sp-core",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-io",
  "sp-runtime",
- "sp-std",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
 ]
 
 [[package]]
@@ -3249,10 +3261,10 @@ dependencies = [
  "pallet-evm",
  "parity-scale-codec",
  "precompile-utils-macro",
- "sp-core",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-io",
  "sp-runtime",
- "sp-std",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-weights",
 ]
 
@@ -3266,7 +3278,7 @@ dependencies = [
  "prettyplease",
  "proc-macro2",
  "quote",
- "sp-core-hashing",
+ "sp-core-hashing 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "syn 1.0.109",
 ]
 
@@ -4428,15 +4440,15 @@ dependencies = [
  "parity-scale-codec",
  "scale-info",
  "sp-api-proc-macro",
- "sp-core",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-metadata-ir",
  "sp-runtime",
- "sp-state-machine",
- "sp-std",
- "sp-trie",
+ "sp-state-machine 0.13.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-trie 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-version",
  "thiserror 1.0.69",
- "typed-cache",
+ "typed-cache 0.1.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
 ]
 
 [[package]]
@@ -4461,9 +4473,9 @@ dependencies = [
  "parity-scale-codec",
  "scale-info",
  "serde",
- "sp-core",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-io",
- "sp-std",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
 ]
 
 [[package]]
@@ -4476,8 +4488,52 @@ dependencies = [
  "parity-scale-codec",
  "scale-info",
  "serde",
- "sp-std",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "static_assertions",
+]
+
+[[package]]
+name = "sp-core"
+version = "7.0.0"
+source = "git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main#70c95bfde0a5797a955e872fcdeaad880a3e6874"
+dependencies = [
+ "array-bytes",
+ "bitflags 1.3.2",
+ "blake2",
+ "bounded-collections",
+ "bs58 0.4.0",
+ "dyn-clonable",
+ "ed25519-zebra 3.1.0",
+ "futures",
+ "hash-db 0.16.0",
+ "hash256-std-hasher",
+ "impl-serde 0.4.0",
+ "lazy_static",
+ "libsecp256k1",
+ "log",
+ "merlin 2.0.1",
+ "parity-scale-codec",
+ "parking_lot",
+ "paste",
+ "primitive-types 0.12.2",
+ "rand 0.8.5",
+ "regex",
+ "scale-info",
+ "schnorrkel 0.9.1",
+ "secp256k1 0.24.3",
+ "secrecy 0.8.0",
+ "serde",
+ "sp-core-hashing 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "sp-debug-derive 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "sp-externalities 0.13.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "sp-runtime-interface 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "sp-storage 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "ss58-registry",
+ "substrate-bip39",
+ "thiserror 1.0.69",
+ "tiny-bip39",
+ "zeroize",
 ]
 
 [[package]]
@@ -4511,17 +4567,31 @@ dependencies = [
  "secp256k1 0.24.3",
  "secrecy 0.8.0",
  "serde",
- "sp-core-hashing",
- "sp-debug-derive",
- "sp-externalities",
- "sp-runtime-interface",
- "sp-std",
- "sp-storage",
+ "sp-core-hashing 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-debug-derive 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-externalities 0.13.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-runtime-interface 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-storage 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "ss58-registry",
  "substrate-bip39",
  "thiserror 1.0.69",
  "tiny-bip39",
  "zeroize",
+]
+
+[[package]]
+name = "sp-core-hashing"
+version = "5.0.0"
+source = "git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main#70c95bfde0a5797a955e872fcdeaad880a3e6874"
+dependencies = [
+ "blake2b_simd",
+ "byteorder",
+ "digest 0.10.7",
+ "sha2 0.10.9",
+ "sha3",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "twox-hash 1.6.3",
 ]
 
 [[package]]
@@ -4534,7 +4604,7 @@ dependencies = [
  "digest 0.10.7",
  "sha2 0.10.9",
  "sha3",
- "sp-std",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "twox-hash 1.6.3",
 ]
 
@@ -4545,7 +4615,7 @@ source = "git+https://github.com/deepdexfinance/polkadot-sdk-par#02668a45e156a3d
 dependencies = [
  "proc-macro2",
  "quote",
- "sp-core-hashing",
+ "sp-core-hashing 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "syn 2.0.112",
 ]
 
@@ -4566,6 +4636,16 @@ dependencies = [
 [[package]]
 name = "sp-debug-derive"
 version = "5.0.0"
+source = "git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main#70c95bfde0a5797a955e872fcdeaad880a3e6874"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.112",
+]
+
+[[package]]
+name = "sp-debug-derive"
+version = "5.0.0"
 source = "git+https://github.com/deepdexfinance/polkadot-sdk-par#02668a45e156a3dd032aacddf1aa2de8d52f3dc2"
 dependencies = [
  "proc-macro2",
@@ -4576,13 +4656,25 @@ dependencies = [
 [[package]]
 name = "sp-externalities"
 version = "0.13.0"
+source = "git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main#70c95bfde0a5797a955e872fcdeaad880a3e6874"
+dependencies = [
+ "environmental",
+ "parity-scale-codec",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "sp-storage 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "typed-cache 0.1.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+]
+
+[[package]]
+name = "sp-externalities"
+version = "0.13.0"
 source = "git+https://github.com/deepdexfinance/polkadot-sdk-par#02668a45e156a3dd032aacddf1aa2de8d52f3dc2"
 dependencies = [
  "environmental",
  "parity-scale-codec",
- "sp-std",
- "sp-storage",
- "typed-cache",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-storage 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "typed-cache 0.1.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
 ]
 
 [[package]]
@@ -4594,9 +4686,9 @@ dependencies = [
  "impl-trait-for-tuples",
  "parity-scale-codec",
  "scale-info",
- "sp-core",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-runtime",
- "sp-std",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "thiserror 1.0.69",
 ]
 
@@ -4614,14 +4706,14 @@ dependencies = [
  "parity-scale-codec",
  "rustversion",
  "secp256k1 0.24.3",
- "sp-core",
- "sp-externalities",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-externalities 0.13.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-keystore",
- "sp-runtime-interface",
- "sp-state-machine",
- "sp-std",
- "sp-tracing",
- "sp-trie",
+ "sp-runtime-interface 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-state-machine 0.13.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-tracing 6.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-trie 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "tracing",
  "tracing-core",
 ]
@@ -4634,8 +4726,8 @@ dependencies = [
  "futures",
  "parity-scale-codec",
  "parking_lot",
- "sp-core",
- "sp-externalities",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-externalities 0.13.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "thiserror 1.0.69",
 ]
 
@@ -4647,7 +4739,17 @@ dependencies = [
  "frame-metadata 15.1.0",
  "parity-scale-codec",
  "scale-info",
- "sp-std",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+]
+
+[[package]]
+name = "sp-panic-handler"
+version = "5.0.0"
+source = "git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main#70c95bfde0a5797a955e872fcdeaad880a3e6874"
+dependencies = [
+ "backtrace",
+ "lazy_static",
+ "regex",
 ]
 
 [[package]]
@@ -4676,10 +4778,28 @@ dependencies = [
  "serde",
  "sp-application-crypto",
  "sp-arithmetic",
- "sp-core",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-io",
- "sp-std",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-weights",
+]
+
+[[package]]
+name = "sp-runtime-interface"
+version = "7.0.0"
+source = "git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main#70c95bfde0a5797a955e872fcdeaad880a3e6874"
+dependencies = [
+ "bytes",
+ "impl-trait-for-tuples",
+ "parity-scale-codec",
+ "primitive-types 0.12.2",
+ "sp-externalities 0.13.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "sp-runtime-interface-proc-macro 6.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "sp-storage 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "sp-tracing 6.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "sp-wasm-interface 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "static_assertions",
 ]
 
 [[package]]
@@ -4691,13 +4811,25 @@ dependencies = [
  "impl-trait-for-tuples",
  "parity-scale-codec",
  "primitive-types 0.12.2",
- "sp-externalities",
- "sp-runtime-interface-proc-macro",
- "sp-std",
- "sp-storage",
- "sp-tracing",
- "sp-wasm-interface",
+ "sp-externalities 0.13.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-runtime-interface-proc-macro 6.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-storage 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-tracing 6.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-wasm-interface 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "static_assertions",
+]
+
+[[package]]
+name = "sp-runtime-interface-proc-macro"
+version = "6.0.0"
+source = "git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main#70c95bfde0a5797a955e872fcdeaad880a3e6874"
+dependencies = [
+ "Inflector",
+ "proc-macro-crate 1.3.1",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.112",
 ]
 
 [[package]]
@@ -4720,9 +4852,32 @@ dependencies = [
  "parity-scale-codec",
  "scale-info",
  "serde",
- "sp-core",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-runtime",
- "sp-std",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+]
+
+[[package]]
+name = "sp-state-machine"
+version = "0.13.0"
+source = "git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main#70c95bfde0a5797a955e872fcdeaad880a3e6874"
+dependencies = [
+ "hash-db 0.16.0",
+ "hex",
+ "kv-db 0.1.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "log",
+ "parity-scale-codec",
+ "parking_lot",
+ "rand 0.8.5",
+ "smallvec",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "sp-externalities 0.13.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "sp-panic-handler 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "sp-trie 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "thiserror 1.0.69",
+ "tracing",
+ "typed-cache 0.1.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
 ]
 
 [[package]]
@@ -4731,26 +4886,44 @@ version = "0.13.0"
 source = "git+https://github.com/deepdexfinance/polkadot-sdk-par#02668a45e156a3dd032aacddf1aa2de8d52f3dc2"
 dependencies = [
  "hash-db 0.16.0",
- "kv-db",
+ "kv-db 0.1.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "log",
  "parity-scale-codec",
  "parking_lot",
  "rand 0.8.5",
  "smallvec",
- "sp-core",
- "sp-externalities",
- "sp-panic-handler",
- "sp-std",
- "sp-trie",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-externalities 0.13.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-panic-handler 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-trie 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "thiserror 1.0.69",
  "tracing",
- "typed-cache",
+ "typed-cache 0.1.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
 ]
 
 [[package]]
 name = "sp-std"
 version = "5.0.0"
+source = "git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main#70c95bfde0a5797a955e872fcdeaad880a3e6874"
+
+[[package]]
+name = "sp-std"
+version = "5.0.0"
 source = "git+https://github.com/deepdexfinance/polkadot-sdk-par#02668a45e156a3dd032aacddf1aa2de8d52f3dc2"
+
+[[package]]
+name = "sp-storage"
+version = "7.0.0"
+source = "git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main#70c95bfde0a5797a955e872fcdeaad880a3e6874"
+dependencies = [
+ "impl-serde 0.4.0",
+ "parity-scale-codec",
+ "ref-cast",
+ "serde",
+ "sp-debug-derive 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+]
 
 [[package]]
 name = "sp-storage"
@@ -4761,8 +4934,8 @@ dependencies = [
  "parity-scale-codec",
  "ref-cast",
  "serde",
- "sp-debug-derive",
- "sp-std",
+ "sp-debug-derive 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
 ]
 
 [[package]]
@@ -4776,8 +4949,20 @@ dependencies = [
  "parity-scale-codec",
  "sp-inherents",
  "sp-runtime",
- "sp-std",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "sp-tracing"
+version = "6.0.0"
+source = "git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main#70c95bfde0a5797a955e872fcdeaad880a3e6874"
+dependencies = [
+ "parity-scale-codec",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "tracing",
+ "tracing-core",
+ "tracing-subscriber 0.2.25",
 ]
 
 [[package]]
@@ -4786,10 +4971,34 @@ version = "6.0.0"
 source = "git+https://github.com/deepdexfinance/polkadot-sdk-par#02668a45e156a3dd032aacddf1aa2de8d52f3dc2"
 dependencies = [
  "parity-scale-codec",
- "sp-std",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "tracing",
  "tracing-core",
  "tracing-subscriber 0.2.25",
+]
+
+[[package]]
+name = "sp-trie"
+version = "7.0.0"
+source = "git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main#70c95bfde0a5797a955e872fcdeaad880a3e6874"
+dependencies = [
+ "ahash 0.8.12",
+ "hash-db 0.16.0",
+ "hashbrown 0.13.2",
+ "kv-db 0.1.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "lazy_static",
+ "memory-db",
+ "nohash-hasher",
+ "parity-scale-codec",
+ "parking_lot",
+ "scale-info",
+ "schnellru",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "thiserror 1.0.69",
+ "tracing",
+ "trie-db",
+ "trie-root",
 ]
 
 [[package]]
@@ -4807,8 +5016,8 @@ dependencies = [
  "parking_lot",
  "scale-info",
  "schnellru",
- "sp-core",
- "sp-std",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "thiserror 1.0.69",
  "tracing",
  "trie-db",
@@ -4827,7 +5036,7 @@ dependencies = [
  "serde",
  "sp-core-hashing-proc-macro",
  "sp-runtime",
- "sp-std",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "sp-version-proc-macro",
  "thiserror 1.0.69",
 ]
@@ -4846,13 +5055,27 @@ dependencies = [
 [[package]]
 name = "sp-wasm-interface"
 version = "7.0.0"
+source = "git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main#70c95bfde0a5797a955e872fcdeaad880a3e6874"
+dependencies = [
+ "anyhow",
+ "impl-trait-for-tuples",
+ "log",
+ "parity-scale-codec",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+ "wasmi 0.13.2",
+ "wasmtime",
+]
+
+[[package]]
+name = "sp-wasm-interface"
+version = "7.0.0"
 source = "git+https://github.com/deepdexfinance/polkadot-sdk-par#02668a45e156a3dd032aacddf1aa2de8d52f3dc2"
 dependencies = [
  "anyhow",
  "impl-trait-for-tuples",
  "log",
  "parity-scale-codec",
- "sp-std",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
  "wasmi 0.13.2",
  "wasmtime",
 ]
@@ -4867,9 +5090,9 @@ dependencies = [
  "serde",
  "smallvec",
  "sp-arithmetic",
- "sp-core",
- "sp-debug-derive",
- "sp-std",
+ "sp-core 7.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-debug-derive 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
 ]
 
 [[package]]
@@ -4958,6 +5181,7 @@ dependencies = [
  "rlp",
  "secp256k1 0.30.0",
  "sha3",
+ "sp-state-machine 0.13.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
  "subxt",
  "subxt-signer",
  "tokio",
@@ -5567,6 +5791,19 @@ checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
 [[package]]
 name = "typed-cache"
 version = "0.1.0"
+source = "git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main#70c95bfde0a5797a955e872fcdeaad880a3e6874"
+dependencies = [
+ "downcast-rs 2.0.2",
+ "lazy_static",
+ "log",
+ "parity-scale-codec",
+ "smallvec",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par.git?branch=main)",
+]
+
+[[package]]
+name = "typed-cache"
+version = "0.1.0"
 source = "git+https://github.com/deepdexfinance/polkadot-sdk-par#02668a45e156a3dd032aacddf1aa2de8d52f3dc2"
 dependencies = [
  "downcast-rs 2.0.2",
@@ -5575,7 +5812,7 @@ dependencies = [
  "once_cell",
  "parity-scale-codec",
  "smallvec",
- "sp-std",
+ "sp-std 5.0.0 (git+https://github.com/deepdexfinance/polkadot-sdk-par)",
 ]
 
 [[package]]
