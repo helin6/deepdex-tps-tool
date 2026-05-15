@@ -5,6 +5,7 @@
 //! - 否则：若当前工作目录存在 **`.env`**，则加载（不存在则忽略）。
 //!
 //! 已在 shell 里 `export` 的变量 **不会被** dotenv 覆盖（与 `dotenvy` 默认行为一致）。
+//! **行内注释**：`KEY=value  # 说明` 在 `docker run --env-file` 下整段会进入环境变量；解析时会按 **`空格+#`** 去掉行尾注释（与常见 `.env` 习惯一致）。
 //!
 //! | 键 / 环境变量 | 含义 | 默认 |
 //! |----------------|------|------|
@@ -37,10 +38,23 @@ fn load_dotenv_into_env() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 去掉「未加引号时」行尾内联注释：`KEY=value  # 说明` → `value`。
+///
+/// - `docker run --env-file` **不会**按 dotenv 规则剥掉行内 `#`，会把 `#` 一并写进环境变量，导致 `u32` 解析失败。
+/// - 仅当存在 **`空格 + #`** 时才截断，避免误伤 `WS_URL=...#fragment`（`#` 前通常无空格）。
+fn strip_inline_comment(s: &str) -> &str {
+    let s = s.trim();
+    if let Some((head, _)) = s.split_once(" #") {
+        head.trim_end()
+    } else {
+        s
+    }
+}
+
 fn pick_string(key: &str, default: &str) -> String {
     env::var(key)
         .ok()
-        .map(|s| s.trim().to_string())
+        .map(|s| strip_inline_comment(&s).to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| default.to_string())
 }
