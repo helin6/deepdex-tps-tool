@@ -29,7 +29,7 @@ use tokio::{self};
 use sha3::Digest;
 use tokio::sync::RwLock;
 
-// subxt metadata --url http://127.0.0.1:9933 --version 14 -f bytes > deepx-node-metadata.scale
+// subxt metadata --url http://127.0.0.1:9944 --version 14 -f bytes > deepx-node-metadata.scale
 #[subxt::subxt(
     runtime_metadata_path = "./deepx-node-metadata.scale",
     derive_for_all_types = "Eq, PartialEq, Clone, Debug"
@@ -55,16 +55,9 @@ const PERP_CANCEL_ORDER_SELECTOR: [u8; 4] = [247, 106, 0, 107];
 
 const PERP_ADDRESS: [u8; 20] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 78];
 
-const NODE_WS_ADDR: &str = "ws://127.0.0.1:9933";
+const NODE_WS_ADDR: &str = "ws://127.0.0.1:9944";
 
-// static ROOTER: LazyLock<Keypair> = LazyLock::new(|| dev::alith());
-
-static ROOTER: LazyLock<Keypair> = LazyLock::new(|| {
-    let mut sk = [0u8; 32];
-    let a = hex::decode("").unwrap();
-    sk.copy_from_slice(&a);
-    Keypair::from_secret_key(sk).unwrap()
-});
+static ROOTER: LazyLock<Keypair> = LazyLock::new(|| dev::alith());
 
 lazy_static::lazy_static! {
     pub static ref READY_ACCOUNT_NUM: RwLock<usize> = RwLock::new(0);
@@ -138,10 +131,11 @@ async fn main() -> anyhow::Result<()> {
         let subaccount = x.subaccount.clone();
         info!("do deposit by account: {:?} to subaccount: {:?}", hex::encode(&kp.public_key().to_account_id().0), subaccount);
         deposit(&kp, &subaccount, 1, "USDT", amount).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
     tokio::time::sleep(Duration::from_millis(5000)).await;
     // let rate = 70; // single thread(full-matched), tps: 6000
-    let rate = 500; // single thread(1% matched), tps: 80000(450*200(acc))
+    let rate = 100; // single thread(1% matched), tps: 80000(450*200(acc))
     // let rate = 280; // single thread(1% matched, evm), tps: 44000(220*200(acc))
     // let rate = 750; // single thread(non-matched), batch ops(1% matched): 148000(74 * 10(ops) * 200(acc))
     // let rate = 70; // multi thread(5, full-matched), tps: 17500
@@ -992,92 +986,92 @@ async fn place_extra_pending_orders(
     let mut next_tick = Instant::now();
     let mut cancel_id: u32 = 0;
     // let mut total_encode_inner = Vec::new();
-    // let mut encoded_inner = Vec::new();
+    let mut encoded_inner = Vec::new();
     let chunk_size = rate;
     let mut inner_num: u32 = 0;
     let mut skip_cancel = false;
 
     for market_id in 2..2 + MARKET_NUM {
-        // let market_id = market_id as u16;
-        // for i in 1..=n {
-        //     let price = if average_pending {
-        //         let price_diff = i % (N as u32 * 5 * MARKET_NUM / 2);
-        //         if is_long {
-        //             match_price * 9 / 10 - price_diff as u128
-        //         } else {
-        //             match_price * 11 / 10 + price_diff as u128
-        //         }
-        //     } else {
-        //         if is_long {
-        //             match_price - index as u128 - 1 // 排在最前面
-        //         } else {
-        //             match_price + index as u128 + 1 // 排在最前面
-        //         }
-        //     };
-        //     let signed_tx_bytes = {
-        //         debug!("{user_name} extra account build place order: {} tx with price: {price} nonce {nonce} for i: {i}", cancel_id + 1);
-        //         cancel_id += 1;
-        //
-        //         let perp_order = PerpOrder {
-        //             order_id: cancel_id,
-        //             owner: subaccount,
-        //             market_id,
-        //             is_long,
-        //             size: 10000,
-        //             price,
-        //             order_type: order_type.clone(),
-        //             create_time: 0,
-        //             leverage: 10,
-        //             slippage: None,
-        //             status: OrderStatus::Open,
-        //             size_filled: 0,
-        //             size_remain: 10000,
-        //             take_profit: None,
-        //             stop_loss: None,
-        //             reduce_only: false,
-        //             post_only: PostOnlyParam::None,
-        //         };
-        //         let call = node_runtime::tx().perp_market().append_order_directly(
-        //             perp_order
-        //         );
-        //         tokio::time::sleep_until(next_tick.into()).await;
-        //         next_tick += interval;
-        //
-        //         let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
-        //         let signed_tx = api.tx().create_partial_offline(&call, params)?.sign(user);
-        //         Bytes::from_owner(signed_tx.into_encoded())
-        //     };
-        //     encoded_inner.extend(signed_tx_bytes);
-        //     inner_num += 1;
-        //     nonce += 1;
-        //     if inner_num >= chunk_size {
-        //         loop {
-        //             let mut extrinsics = Vec::new();
-        //             Compact(inner_num).encode_to(&mut extrinsics);
-        //             extrinsics.extend(encoded_inner.clone());
-        //             match rpc.author_submit_extrinsics(&extrinsics).await {
-        //                 Ok(batch_res) => {
-        //                     for res in batch_res {
-        //                         if let Err(e) = res {
-        //                             warn!("Error submitting inner extrinsics for {user_name}: {:?}, try again", e);
-        //                         }
-        //                     }
-        //                     info!("{user_name} Submitting batch extrinsics successfully");
-        //                     break;
-        //                 }
-        //                 Err(e) => {
-        //                     warn!("Error submitting batch extrinsics for {user_name}: {:?}, try again", e);
-        //                     tokio::time::sleep(Duration::from_millis(600)).await;
-        //                     continue;
-        //                 }
-        //             }
-        //         }
-        //         inner_num = 0;
-        //         encoded_inner = Vec::new();
-        //         tokio::time::sleep(Duration::from_millis(1000)).await;
-        //         next_tick += interval * chunk_size;
-        //     }
-        // }
+        let market_id = market_id as u16;
+        for i in 1..=n {
+            let price = if average_pending {
+                let price_diff = i % (N as u32 * 5 * MARKET_NUM / 2);
+                if is_long {
+                    match_price * 9 / 10 - price_diff as u128
+                } else {
+                    match_price * 11 / 10 + price_diff as u128
+                }
+            } else {
+                if is_long {
+                    match_price - index as u128 - 1 // 排在最前面
+                } else {
+                    match_price + index as u128 + 1 // 排在最前面
+                }
+            };
+            let signed_tx_bytes = {
+                debug!("{user_name} extra account build place order: {} tx with price: {price} nonce {nonce} for i: {i}", cancel_id + 1);
+                cancel_id += 1;
+
+                let perp_order = PerpOrder {
+                    order_id: cancel_id,
+                    owner: subaccount,
+                    market_id,
+                    is_long,
+                    size: 10000,
+                    price,
+                    order_type: order_type.clone(),
+                    create_time: 0,
+                    leverage: 10,
+                    slippage: None,
+                    status: OrderStatus::Open,
+                    size_filled: 0,
+                    size_remain: 10000,
+                    take_profit: None,
+                    stop_loss: None,
+                    reduce_only: false,
+                    post_only: PostOnlyParam::None,
+                };
+                let call = node_runtime::tx().perp_market().append_order_directly(
+                    perp_order
+                );
+                tokio::time::sleep_until(next_tick.into()).await;
+                next_tick += interval;
+
+                let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
+                let signed_tx = api.tx().create_partial_offline(&call, params)?.sign(user);
+                Bytes::from_owner(signed_tx.into_encoded())
+            };
+            encoded_inner.extend(signed_tx_bytes);
+            inner_num += 1;
+            nonce += 1;
+            if inner_num >= chunk_size {
+                loop {
+                    let mut extrinsics = Vec::new();
+                    Compact(inner_num).encode_to(&mut extrinsics);
+                    extrinsics.extend(encoded_inner.clone());
+                    match rpc.author_submit_extrinsics(&extrinsics).await {
+                        Ok(batch_res) => {
+                            for res in batch_res {
+                                if let Err(e) = res {
+                                    warn!("Error submitting inner extrinsics for {user_name}: {:?}, try again", e);
+                                }
+                            }
+                            info!("{user_name} Submitting batch extrinsics successfully");
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("Error submitting batch extrinsics for {user_name}: {:?}, try again", e);
+                            tokio::time::sleep(Duration::from_millis(600)).await;
+                            continue;
+                        }
+                    }
+                }
+                inner_num = 0;
+                encoded_inner = Vec::new();
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                next_tick += interval * chunk_size;
+            }
+        }
     }
 
     Ok(())
