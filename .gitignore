@@ -1,3 +1,10 @@
 /target
 .env
 .docker-github-netrc
+
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+contracts/lib/ 
+.idea/
+.DS_Store

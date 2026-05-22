@@ -41,8 +41,12 @@ COPY deepx-node-metadata.scale ./
 COPY src ./src
 
 # 私有 GitHub：传 --secret id=git_netrc,...；git/cargo 会读 /root/.netrc
+# 不编 subtx-test / testnet_test（依赖 precompile-utils → 当前 polkadot-sdk-par 修订无法通过编译）
 RUN --mount=type=secret,id=git_netrc,target=/root/.netrc,required=false \
-    cargo build --locked --release
+    cargo build --locked --release \
+      --bin rooter_deposit \
+      --bin perp_bench \
+      --bin perp_bench_fence
 
 FROM docker.io/library/debian:bookworm-slim AS runtime
 
@@ -56,7 +60,5 @@ ENV RUST_LOG=info
 COPY --from=builder /build/target/release/perp_bench_fence /usr/local/bin/
 COPY --from=builder /build/target/release/perp_bench /usr/local/bin/
 COPY --from=builder /build/target/release/rooter_deposit /usr/local/bin/
-COPY --from=builder /build/target/release/testnet_test /usr/local/bin/
-COPY --from=builder /build/target/release/subtx-test /usr/local/bin/
 
 CMD ["perp_bench_fence"]

@@ -13,10 +13,15 @@
 //!
 //! 内存约 **账户数 × n × 单笔编码大小**；大账户数、长 `BENCH_DURATION_SEC` 时请自行评估机器 RAM。编签并发受 **`CHAIN_SCAN_CONCURRENCY`** 限制，以降低瞬时 CPU/内存尖峰。
 //!
-//! ## 额外环境变量
+//! ## 环境变量（`ShardRunConfig::load()` 会加载 `.env`）
 //!
 //! | 变量 | 含义 | 默认 |
 //! |------|------|------|
+//! | `BENCH_MARKET_ID` | **发单/撤单/平仓** 使用的永续 `market_id` | `3` |
+//! | `BENCH_ORDER_SIZE` | `place_order` 的 `size` | `1000000000000000` |
+//! | `BENCH_MATCHED_PERCENT` | 与 `testnet_test` 的 `MATCHED_PERCENT` 同义 | `0` |
+//! | `BENCH_DURATION_SEC` | 每账户预编笔数 = `RATE ×` 本项；发送节流墙钟约本项秒数 | `60` |
+//! | `BENCH_PREP_CONCURRENCY` / `BENCH_SKIP_PREP` | 准备阶段 | 见 `perp_bench` |
 //! | `FENCE_POOL_SENDERS` | 池 worker 数量（与 `testnet_test` 的 `pool_sender_num` 同角色） | `20` |
 //! | `FENCE_THROTTLE_SEC` | 每批 RPC **之后**额外睡眠秒数（默认 `0`） | `0` |
 //! | `FENCE_BURST_SUBMIT` | 设为 `1`/`true` 时**关闭**批间 1s 节流（旧行为：尽快发完） | 关 |
@@ -50,7 +55,7 @@ use tokio::task::JoinSet;
 
 use log::{info, warn};
 use subtx_test::chain_ws;
-use subtx_test::shard_run_config::ShardRunConfig;
+use subtx_test::shard_run_config::{env_truthy, env_u16, env_u64, ShardRunConfig};
 
 #[subxt::subxt(
     runtime_metadata_path = "./deepx-node-metadata.scale",
@@ -111,32 +116,9 @@ struct BenchExtra {
     post_chain_scan_sec: u64,
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_truthy(key: &str) -> bool {
-    matches!(
-        std::env::var(key)
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
 impl BenchExtra {
     fn from_env() -> anyhow::Result<Self> {
-        let matched_percent: u32 = std::env::var("BENCH_MATCHED_PERCENT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        if matched_percent > 100 {
-            anyhow::bail!("BENCH_MATCHED_PERCENT 必须在 0..=100");
-        }
+        let matched_percent: u32 = env_u64("BENCH_MATCHED_PERCENT", 0).min(100) as u32;
         Ok(Self {
             duration_sec: env_u64("BENCH_DURATION_SEC", 60).max(1),
             scan_concurrency: env_u64("CHAIN_SCAN_CONCURRENCY", 64).clamp(1, 512) as usize,
@@ -145,7 +127,7 @@ impl BenchExtra {
                 .ok()
                 .and_then(|s| s.parse().ok()),
             skip_prep: env_truthy("BENCH_SKIP_PREP"),
-            market_id: env_u64("BENCH_MARKET_ID", 3).min(u16::MAX as u64) as u16,
+            market_id: env_u16("BENCH_MARKET_ID", 3)?,
             order_size: env_u64("BENCH_ORDER_SIZE", 1_000_000_000_000_000) as u128,
             matched_percent,
             pool_senders: env_u64("FENCE_POOL_SENDERS", 20).clamp(1, 256) as u32,
@@ -768,6 +750,11 @@ async fn main() -> anyhow::Result<()> {
     let shard = ShardRunConfig::load()?;
     chain_ws::init(shard.ws_url.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
     let bench = BenchExtra::from_env()?;
+    let mark_price = load_mark_price(bench.market_id).await?;
+    info!(
+        "发单市场: BENCH_MARKET_ID={} mark_price={} order_size={}",
+        bench.market_id, mark_price, bench.order_size
+    );
     info!("shard: {}", shard.summary());
     info!(
         "perp_bench_fence: duration={}s scan_conc={} prep_conc={} start_at_ms={:?} skip_prep={} market={} pool_senders={} throttle_after_sec={} burst_submit={} post_chain_scan_sec={} matched%={}",

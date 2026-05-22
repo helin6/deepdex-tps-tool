@@ -68,6 +68,75 @@ fn pick_u32(key: &str, default: u32) -> anyhow::Result<u32> {
         .map_err(|e| anyhow::anyhow!("{key}={s:?} 不是合法 u32: {e}"))
 }
 
+/// 读取环境变量字符串（空则用 `default`）。
+pub fn env_string(key: &str, default: &str) -> String {
+    pick_string(key, default)
+}
+
+/// 读取环境变量为 `u128`。
+pub fn env_u128(key: &str, default: u128) -> u128 {
+    let s = pick_string(key, "");
+    if s.is_empty() {
+        return default;
+    }
+    s.parse().unwrap_or_else(|e| {
+        log::warn!("{key}={s:?} 解析 u128 失败 ({e})，使用默认 {default}");
+        default
+    })
+}
+
+/// 读取环境变量为 `u64`（支持 `KEY=val  # 注释` 行内注释剥离）。
+pub fn env_u64(key: &str, default: u64) -> u64 {
+    let s = pick_string(key, "");
+    if s.is_empty() {
+        return default;
+    }
+    s.parse().unwrap_or_else(|e| {
+        log::warn!("{key}={s:?} 解析 u64 失败 ({e})，使用默认 {default}");
+        default
+    })
+}
+
+/// 读取环境变量为 `u16`（永续 `market_id` 等）；`0` 视为非法。
+pub fn env_u16(key: &str, default: u16) -> anyhow::Result<u16> {
+    let s = pick_string(key, "");
+    let raw: u32 = if s.is_empty() {
+        default as u32
+    } else {
+        s.parse()
+            .map_err(|e| anyhow::anyhow!("{key}={s:?} 不是合法 u16: {e}"))?
+    };
+    if raw == 0 {
+        anyhow::bail!("{key} 必须 > 0");
+    }
+    Ok(raw.min(u16::MAX as u32) as u16)
+}
+
+/// 读取可选 `H160`（空或未设置返回 `None`）。
+pub fn env_h160_optional(key: &str) -> anyhow::Result<Option<subxt::utils::H160>> {
+    let s = pick_string(key, "");
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let raw = s.strip_prefix("0x").unwrap_or(&s);
+    let bytes = hex::decode(raw)
+        .map_err(|e| anyhow::anyhow!("{key}={s:?} 不是合法 hex 地址: {e}"))?;
+    if bytes.len() != 20 {
+        anyhow::bail!("{key} 长度必须为 20 字节，实际 {}", bytes.len());
+    }
+    let mut arr = [0u8; 20];
+    arr.copy_from_slice(&bytes);
+    Ok(Some(subxt::utils::H160(arr)))
+}
+
+/// 环境变量是否为真（`1` / `true` / `yes` / `on`，大小写不敏感）。
+pub fn env_truthy(key: &str) -> bool {
+    matches!(
+        pick_string(key, "").to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct ShardRunConfig {
     pub ws_url: String,

@@ -3,15 +3,34 @@
 //! 再由该用户签名 `initialize_subaccount`；否则测试网会报 `Invalid signing address`。
 //! 多机压测前：先在一台机器上对**全体** `FIRST_ADDR_INDEX` + `ACCOUNT_COUNT` 跑一次（可多次跑，已充会 skip），
 //! 完成后各分片机器可跑 `perp_bench` 发压（见 `.env.example`）。
+//!
+//! ## 批量 deposit（Multicall）
+//!
+//! 部署 `contracts/src/RootDepositMulticall.sol` 后，在 `.env` 设置 `ROOT_DEPOSIT_MULTICALL=0x...`，
+//! 则 deposit 走 **一笔 EVM 交易内批量调用 Lending 预编译**，替代 ROOTER 逐笔 Substrate `lending.deposit`。
+//! 部署：`scripts/deploy_root_deposit_multicall.sh`（需 Foundry、`ROOTER_PRIVATE_KEY`、`WS_URL`）。
+//!
+//! 编译/运行：`cargo run --bin rooter_deposit`（勿加默认 `precompile-utils` feature，见 `Cargo.toml`）。
+//!
+//! | 变量 | 含义 | 默认 |
+//! |------|------|------|
+//! | `ROOT_DEPOSIT_MULTICALL` | Multicall 合约地址；**未设置**则仍用逐笔 Substrate deposit | 无 |
+//! | `DEPOSIT_MULTICALL_BATCH_SIZE` | 每笔 EVM 交易 batch 的子账户数 | `40` |
+//! | `ROOTER_DEPOSIT_ASSET` | 本批存入的资产符号（如 `usdc`） | `usdc` |
+//! | `ROOTER_DEPOSIT_AMOUNT` | 每个子账户存入数量 | `100000000` |
 
 #![allow(missing_docs)]
 #![allow(dead_code)]
 
 use bytes::Bytes;
+use ethereum::{EIP1559Transaction as EthEip1559, EIP1559TransactionMessage, TransactionAction as EthTxAction};
 use node_runtime::runtime_types::bounded_collections::bounded_vec::BoundedVec;
+use node_runtime::runtime_types::ethereum::transaction::{EIP1559Transaction, TransactionAction, TransactionV2};
+use node_runtime::runtime_types::primitive_types::U256;
+use secp256k1::ecdsa::RecoveryId;
 use std::str::FromStr;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subxt::backend::rpc::RpcClient;
 use subxt::config::substrate::SubstrateExtrinsicParamsBuilder;
 use subxt::config::{substrate, SubstrateExtrinsicParams};
@@ -27,13 +46,16 @@ use tokio::task::JoinSet;
 
 use log::{debug, info, warn};
 use subtx_test::chain_ws;
-use subtx_test::shard_run_config::ShardRunConfig;
+use subtx_test::multicall_deposit::{chunk_subaccounts, encode_batch_deposit};
+use subtx_test::shard_run_config::{env_h160_optional, env_string, env_u128, ShardRunConfig};
 
 #[subxt::subxt(
     runtime_metadata_path = "./deepx-node-metadata.scale",
     derive_for_all_types = "Eq, PartialEq, Clone, Debug"
 )]
 pub mod node_runtime {}
+
+use node_runtime::system::events::remarked::Hash;
 
 static ROOTER: LazyLock<Keypair> = LazyLock::new(|| {
     let mut sk = [0u8; 32];
@@ -82,6 +104,9 @@ struct AccountDetail {
     #[allow(dead_code)]
     order_num: u32,
 }
+
+/// Lending 市场 ID。Multicall / EVM 预编译 `deposit` 在链上固定为 1，positions 检查与之对齐。
+const LENDING_MARKET_ID: u8 = 1;
 
 /// 轮询建子账户最大次数（与 `INIT_POLL_*` 间隔配合）。
 const INIT_POLL_MAX: u32 = 30;
@@ -226,21 +251,131 @@ async fn deposit(
     Ok(())
 }
 
-async fn check_deposit(account: &AccountDetail) -> anyhow::Result<bool> {
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_millis() as u64
+}
+
+fn build_eip1559_tx_to_v2(tx: EthEip1559, signer: &Keypair) -> anyhow::Result<TransactionV2> {
+    let tx_msg = EIP1559TransactionMessage::from(tx);
+    let sk = signer.clone().secret_key();
+    let secret = secp256k1::SecretKey::from_byte_array(&sk.into())?;
+    let signing_message = secp256k1::Message::from_digest(tx_msg.hash().to_fixed_bytes());
+    let signature = secp256k1::Secp256k1::new().sign_ecdsa_recoverable(&signing_message, &secret);
+    let (recid, rs) = signature.serialize_compact();
+    let r = Hash::from_slice(&rs[0..32]);
+    let s = Hash::from_slice(&rs[32..64]);
+
+    let eip1559 = EIP1559Transaction {
+        chain_id: tx_msg.chain_id,
+        nonce: U256(tx_msg.nonce.0),
+        max_priority_fee_per_gas: U256(tx_msg.max_priority_fee_per_gas.0),
+        max_fee_per_gas: U256(tx_msg.max_fee_per_gas.0),
+        gas_limit: U256(tx_msg.gas_limit.0),
+        action: match tx_msg.action {
+            EthTxAction::Call(addr) => TransactionAction::Call(addr.0.into()),
+            _ => anyhow::bail!("仅支持 Call 类型 EVM 交易"),
+        },
+        value: U256(tx_msg.value.0),
+        input: tx_msg.input.clone(),
+        access_list: vec![],
+        odd_y_parity: recid != RecoveryId::Zero,
+        r: r.clone(),
+        s: s.clone(),
+    };
+    Ok(TransactionV2::EIP1559(eip1559))
+}
+
+/// 通过 Multicall 合约在一笔 `ethereum.transact` 内对多个子账户 `deposit`。
+async fn deposit_batch_via_multicall(
+    root_kp: &Keypair,
+    multicall: H160,
+    subaccounts: &[H160],
+    asset: &str,
+    amount: u128,
+    evm_nonce: u64,
+) -> anyhow::Result<()> {
+    if subaccounts.is_empty() {
+        return Ok(());
+    }
+    let api = get_api().await?;
+    let rpc = get_rpc().await?;
+    let chain_id_query = node_runtime::storage().evm_chain_id().chain_id();
+    let chain_id = api
+        .storage()
+        .at_latest()
+        .await?
+        .fetch(&chain_id_query)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("无法读取 evm_chain_id"))?;
+
+    let calldata = encode_batch_deposit(subaccounts, asset.as_bytes(), amount);
+    let gas_limit = 200_000u64.saturating_add(120_000u64.saturating_mul(subaccounts.len() as u64));
+
+    let eip1559 = EthEip1559 {
+        chain_id,
+        nonce: evm_nonce.into(),
+        max_priority_fee_per_gas: 1_500_000_000u64.into(),
+        max_fee_per_gas: 4_500_000_000u64.into(),
+        gas_limit: gas_limit.into(),
+        action: EthTxAction::Call(multicall.0.into()),
+        value: 0u64.into(),
+        input: calldata,
+        access_list: vec![],
+        odd_y_parity: false,
+        r: Default::default(),
+        s: Default::default(),
+    };
+    let transaction = build_eip1559_tx_to_v2(eip1559, root_kp)?;
+    let source_acc: H160 = root_kp.public_key().to_account_id().0.into();
+    let call = node_runtime::tx()
+        .ethereum()
+        .transact(transaction, source_acc);
+    let params = SubstrateExtrinsicParamsBuilder::new()
+        .nonce(evm_nonce)
+        .build();
+    let signed = api.tx().create_partial_offline(&call, params)?.sign(root_kp);
+    let bytes = Bytes::from_owner(signed.into_encoded());
+    match rpc.author_submit_extrinsic(&bytes).await {
+        Ok(_) => {
+            debug!(
+                "multicall batchDeposit ok: n={} asset={} amount={} multicall={:?}",
+                subaccounts.len(),
+                asset,
+                amount,
+                multicall
+            );
+        }
+        Err(e) => {
+            warn!(
+                "multicall batchDeposit 提交失败 (n={}): {:?}",
+                subaccounts.len(),
+                e
+            );
+            return Err(e.into());
+        }
+    }
+    Ok(())
+}
+
+/// 子账户在 lending market 1 是否已有该资产的存款（有则跳过本次 deposit）。
+async fn check_deposit(account: &AccountDetail, asset: &[u8]) -> anyhow::Result<bool> {
     let api = get_api().await?;
     let position_query = node_runtime::storage().lending().positions_for(
         AccountId20 {
             0: account.subaccount.clone().0,
         },
-        1,
+        LENDING_MARKET_ID,
     );
     let positions = api.storage().at_latest().await?.fetch(&position_query).await?;
-    let skip_deposit = if let Some(positions) = positions {
-        !positions.deposits.is_empty()
-    } else {
-        false
-    };
-    Ok(skip_deposit)
+    let skip = positions.is_some_and(|p| {
+        p.deposits.iter().any(|(key, amount)| {
+            key.0 == LENDING_MARKET_ID && key.1.0.as_slice() == asset && *amount > 0
+        })
+    });
+    Ok(skip)
 }
 
 async fn create_sharded_test_accounts(
@@ -274,7 +409,6 @@ async fn create_sharded_test_accounts(
     Ok(result)
 }
 
-const DEPOSIT_AMOUNT: u128 = 100_000_000;
 const INIT_QUOTA: u32 = 429467295;
 
 /// 未激活的 EVM 账户无法签原生 pallet 调用；由 ROOTER 代提 `activate_account` 与 `manager_add_quota`。
@@ -361,11 +495,35 @@ async fn ensure_quota_for_test_user(root_kp: &Keypair, user: &Keypair) -> anyhow
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
     let cfg = ShardRunConfig::load()?;
+    let deposit_asset = env_string("ROOTER_DEPOSIT_ASSET", "usdc");
+    if deposit_asset.is_empty() {
+        anyhow::bail!("ROOTER_DEPOSIT_ASSET 不能为空");
+    }
+    let deposit_amount = env_u128("ROOTER_DEPOSIT_AMOUNT", 100_000_000);
+    if deposit_amount == 0 {
+        anyhow::bail!("ROOTER_DEPOSIT_AMOUNT 必须 > 0");
+    }
+    let multicall_addr = env_h160_optional("ROOT_DEPOSIT_MULTICALL")?;
+    let deposit_batch_size = env_u64("DEPOSIT_MULTICALL_BATCH_SIZE", 40).clamp(1, 200) as usize;
     info!("rooter_deposit {}", cfg.summary());
     info!(
         "rooter_deposit 性能参数（可用环境变量覆盖，见 crate 顶部说明）: {:?}",
         &*ROOTER_TUNE
     );
+    info!(
+        "deposit 目标: asset={:?} amount={} (lending market_id={})",
+        deposit_asset, deposit_amount, LENDING_MARKET_ID
+    );
+    if let Some(mc) = multicall_addr {
+        info!(
+            "deposit 模式: Multicall batch（合约 {:?}，每批最多 {} 户）",
+            mc, deposit_batch_size
+        );
+    } else {
+        info!(
+            "deposit 模式: 逐笔 Substrate lending.deposit（设置 ROOT_DEPOSIT_MULTICALL 可启用 Multicall）"
+        );
+    }
     chain_ws::init(cfg.ws_url.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     tokio::time::sleep(Duration::from_millis(2000)).await;
@@ -584,18 +742,21 @@ async fn main() -> anyhow::Result<()> {
 
     let n_acct = accounts.len();
     info!(
-        "ROOTER lending deposit：先并行检查 positions（{} 个账户，每批并发 {}），再串行 submit（ROOTER 单 nonce，无法并行上链）",
+        "ROOTER lending deposit：先并行检查是否已有 {:?} 存款（{} 个账户，每批并发 {}）",
+        deposit_asset,
         n_acct,
         PARALLEL_CHAIN_SCAN
     );
     let mut need_deposit: Vec<usize> = Vec::new();
+    let asset_bytes = deposit_asset.as_bytes().to_vec();
     for chunk_start in (0..n_acct).step_by(PARALLEL_CHAIN_SCAN) {
         let end = (chunk_start + PARALLEL_CHAIN_SCAN).min(n_acct);
         let mut set = JoinSet::new();
         for i in chunk_start..end {
             let x = accounts[i].clone();
+            let asset_bytes = asset_bytes.clone();
             set.spawn(async move {
-                let skip = check_deposit(&x).await?;
+                let skip = check_deposit(&x, &asset_bytes).await?;
                 Ok::<_, anyhow::Error>((i, skip))
             });
         }
@@ -609,35 +770,75 @@ async fn main() -> anyhow::Result<()> {
     }
     need_deposit.sort_unstable();
     let skipped = (n_acct - need_deposit.len()) as u32;
+    let n_dep = need_deposit.len();
     info!(
-        "positions 检查结束：将新发起 deposit {} 笔，跳过已充 {} 笔；串行 submit（ROOTER 单 nonce，整体耗时主要取决于 RPC/池子）…",
-        need_deposit.len(),
-        skipped
+        "positions 检查结束（asset={:?}）：将新发起 deposit {} 笔，跳过已有该资产 {} 笔",
+        deposit_asset, n_dep, skipped
     );
 
     let mut done = 0u32;
-    let n_dep = need_deposit.len();
-    for (di, &i) in need_deposit.iter().enumerate() {
-        let x = &accounts[i];
-        if di == 0 || (di + 1) % 50 == 0 || di + 1 == n_dep {
-            info!(
-                "deposit submit 进度 {}/{}（当前 {}）",
-                di + 1,
-                n_dep,
-                x.name
-            );
+    if let Some(multicall) = multicall_addr {
+        let subs: Vec<H160> = need_deposit
+            .iter()
+            .map(|&i| accounts[i].subaccount)
+            .collect();
+        let total_batches = subs.len().div_ceil(deposit_batch_size);
+        let mut evm_nonce = unix_ms();
+        let mut batch_no = 0u32;
+        for chunk in chunk_subaccounts(&subs, deposit_batch_size) {
+            batch_no += 1;
+            if batch_no == 1 || batch_no == total_batches as u32 || batch_no % 10 == 0 {
+                info!(
+                    "multicall deposit 批 {}/{}（本批 {} 户，累计约 {} 户）",
+                    batch_no,
+                    total_batches,
+                    chunk.len(),
+                    done.saturating_add(chunk.len() as u32)
+                );
+            }
+            deposit_batch_via_multicall(
+                &root_kp,
+                multicall,
+                chunk,
+                &deposit_asset,
+                deposit_amount,
+                evm_nonce,
+            )
+            .await?;
+            done = done.saturating_add(chunk.len() as u32);
+            evm_nonce = evm_nonce.saturating_add(1).max(unix_ms());
+            tokio::time::sleep(Duration::from_millis(80)).await;
         }
-        debug!("ROOTER deposit -> {:?} ({})", x.subaccount, x.name);
-        deposit(
-            &root_kp,
-            &x.subaccount,
-            1,
-            "usdc",
-            DEPOSIT_AMOUNT,
-            &mut root_nonce,
-        )
-        .await?;
-        done += 1;
+        info!(
+            "multicall deposit 完成: {} 笔子账户存款，{} 笔 EVM 交易（batch_size={}）",
+            done, batch_no, deposit_batch_size
+        );
+    } else {
+        info!(
+            "逐笔 Substrate deposit（ROOTER 单 nonce，整体耗时主要取决于 RPC/池子）…"
+        );
+        for (di, &i) in need_deposit.iter().enumerate() {
+            let x = &accounts[i];
+            if di == 0 || (di + 1) % 50 == 0 || di + 1 == n_dep {
+                info!(
+                    "deposit submit 进度 {}/{}（当前 {}）",
+                    di + 1,
+                    n_dep,
+                    x.name
+                );
+            }
+            debug!("ROOTER deposit -> {:?} ({})", x.subaccount, x.name);
+            deposit(
+                &root_kp,
+                &x.subaccount,
+                LENDING_MARKET_ID,
+                &deposit_asset,
+                deposit_amount,
+                &mut root_nonce,
+            )
+            .await?;
+            done += 1;
+        }
     }
 
     info!(

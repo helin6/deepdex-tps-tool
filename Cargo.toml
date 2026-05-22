@@ -2,6 +2,7 @@
 name = "subtx-test"
 version = "0.1.0"
 edition = "2024"
+autobins = false
 
 [dependencies]
 subxt = { git = "https://github.com/deepdexfinance/subxt", branch = "v0.44.0-fix-events-map" }
@@ -14,8 +15,7 @@ hex-literal = "1.1.0"
 anyhow = "1.0"
 tracing-subscriber = "0.3.22"
 bytes = "1.11.0"
-precompile-utils = { git = "https://github.com/deepdexfinance/frontier.git", branch = "deepdexfinance-par" }
-sp-state-machine = { git = "https://github.com/deepdexfinance/polkadot-sdk-par.git", branch = "main", features = ["kvdb"] }
+precompile-utils = { git = "https://github.com/deepxfinance/frontier.git", branch = "global-typed", optional = true }
 primitive-types = "0.12.2"
 ethereum = { version = "0.14.0" }
 secp256k1 = "0.30.0"
@@ -25,3 +25,31 @@ rlp = { version = "0.5.2", features = ["derive"] }
 sha3 = "0.10.7"
 lazy_static = "1.4.0"
 dotenvy = "0.15"
+ethabi = "18.0"
+
+[features]
+default = []
+# main / testnet_test 编码 EVM calldata 时需要；rooter_deposit / perp_bench* 不要开（会拉坏掉的 sp-state-machine）
+precompile-utils = ["dep:precompile-utils"]
+
+[[bin]]
+name = "subtx-test"
+path = "src/main.rs"
+required-features = ["precompile-utils"]
+
+[[bin]]
+name = "rooter_deposit"
+path = "src/bin/rooter_deposit.rs"
+
+[[bin]]
+name = "perp_bench"
+path = "src/bin/perp_bench.rs"
+
+[[bin]]
+name = "perp_bench_fence"
+path = "src/bin/perp_bench_fence.rs"
+
+[[bin]]
+name = "testnet_test"
+path = "src/bin/testnet_test.rs"
+required-features = ["precompile-utils"]
