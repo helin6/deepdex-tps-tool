@@ -38,6 +38,7 @@ pub mod node_runtime {}
 
 use crate::node_runtime::system::events::remarked::Hash;
 use log::{debug, error, info, warn};
+#[cfg(feature = "precompile-utils")]
 use precompile_utils::solidity::codec::Writer as EvmDataWriter;
 use secp256k1::ecdsa::RecoveryId;
 use subxt::ext::codec::{alloc, Compact, Encode};
@@ -56,7 +57,8 @@ const PERP_CANCEL_ORDER_SELECTOR: [u8; 4] = [247, 106, 0, 107];
 const PERP_ADDRESS: [u8; 20] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 78];
 
 //const NODE_WS_ADDR: &str = "wss://rpc-testnet.deepx.fi";
-const NODE_WS_ADDR: &str = "ws://136.110.109.17:9937";
+//const NODE_WS_ADDR: &str = "ws://136.110.109.17:9937";
+const NODE_WS_ADDR: &str = "ws://192.168.201.11:9923";
 static GLOBAL_API: OnceCell<OnlineClient<EthRuntimeConfig>> = OnceCell::const_new();
 static GLOBAL_RPC: OnceCell<RpcClient> = OnceCell::const_new();
 
@@ -81,7 +83,7 @@ const SIZE_OF_EACH_ORDER: u128 = 10_000;
 const MATCHED_PERCENT: u32 = 0; // 1%
 
 const BATCH_OPS_NUM: u32 = 1;
-const TEST_ACCOUNT_NUM: u32 = 20;
+const TEST_ACCOUNT_NUM: u32 = 200;
 const TEST_MARKET_ID: u16 = 3;
 const PENDING_NUM: u32 = 0;
 const MARKET_NUM: u32 = 1;
@@ -441,6 +443,7 @@ async fn get_rpc() -> anyhow::Result<LegacyRpcMethods<EthRuntimeConfig>> {
     Ok(LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client.clone()))
 }
 
+#[cfg(feature = "precompile-utils")]
 async fn place_order_no_wait_response_evm_old(
     user_name: &str,
     user: &Keypair,
@@ -555,6 +558,7 @@ async fn place_order_no_wait_response_evm_old(
     Ok(())
 }
 
+#[cfg(feature = "precompile-utils")]
 async fn place_order_no_wait_response_evm(
     user_name: &str,
     user: &Keypair,

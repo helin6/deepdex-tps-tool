@@ -4,7 +4,7 @@
 //! - 若设置 **`ENV_FILE`**：从该路径加载（文件须存在）；
 //! - 否则：若当前工作目录存在 **`.env`**，则加载（不存在则忽略）。
 //!
-//! 已在 shell 里 `export` 的变量 **不会被** dotenv 覆盖（与 `dotenvy` 默认行为一致）。
+//! 加载 `.env` / `ENV_FILE` 时 **会覆盖** 同名 shell 环境变量（便于改 `.env` 后立即生效）。
 //! **行内注释**：`KEY=value  # 说明` 在 `docker run --env-file` 下整段会进入环境变量；解析时会按 **`空格+#`** 去掉行尾注释（与常见 `.env` 习惯一致）。
 //!
 //! | 键 / 环境变量 | 含义 | 默认 |
@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 const DEFAULT_WS: &str = "ws://136.110.109.17:9937";
 
-/// 将 `ENV_FILE` 或默认 `.env` 载入进程环境（不覆盖已有变量）。
+/// 将 `ENV_FILE` 或默认 `.env` 载入进程环境（覆盖同名 shell 变量）。
 fn load_dotenv_into_env() -> anyhow::Result<()> {
     match env::var("ENV_FILE") {
         Ok(raw) => {
@@ -28,11 +28,11 @@ fn load_dotenv_into_env() -> anyhow::Result<()> {
             if !path.is_file() {
                 anyhow::bail!("ENV_FILE 不是可读文件: {}", path.display());
             }
-            dotenvy::from_path(&path)
+            dotenvy::from_path_override(&path)
                 .map_err(|e| anyhow::anyhow!("读取 ENV_FILE {}: {}", path.display(), e))?;
         }
         Err(_) => {
-            let _ = dotenvy::dotenv();
+            let _ = dotenvy::dotenv_override();
         }
     }
     Ok(())

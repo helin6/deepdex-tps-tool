@@ -2,5 +2,6 @@
 #![allow(missing_docs)]
 
 pub mod chain_ws;
+pub mod evm_rpc;
 pub mod multicall_deposit;
 pub mod shard_run_config;

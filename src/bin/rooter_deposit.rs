@@ -1,37 +1,17 @@
-//! 单实例由 ROOTER 给一段 `addr_idx` 范围内的测试账户子账户充 USDC。
-//! 若链上尚无 `user_stats`，会先用 **ROOTER** 做 `quota.activate_account` + `manager_add_quota`（与 `src/main.rs` 里 `create_extra_test_accounts` 一致），
-//! 再由该用户签名 `initialize_subaccount`；否则测试网会报 `Invalid signing address`。
-//! 多机压测前：先在一台机器上对**全体** `FIRST_ADDR_INDEX` + `ACCOUNT_COUNT` 跑一次（可多次跑，已充会 skip），
-//! 完成后各分片机器可跑 `perp_bench` 发压（见 `.env.example`）。
+//! ROOTER 为 `FIRST_ADDR_INDEX`..`+ACCOUNT_COUNT` 测试账户：quota 激活 → `initialize_subaccount` → USDC 存款。
+//! Multicall 见 `ROOT_DEPOSIT_MULTICALL`；环境变量见 `.env.example`。
 //!
-//! ## 批量 deposit（Multicall）
-//!
-//! 部署 `contracts/src/RootDepositMulticall.sol` 后，在 `.env` 设置 `ROOT_DEPOSIT_MULTICALL=0x...`，
-//! 则 deposit 走 **一笔 EVM 交易内批量调用 Lending 预编译**，替代 ROOTER 逐笔 Substrate `lending.deposit`。
-//! 部署：`scripts/deploy_root_deposit_multicall.sh`（需 Foundry、`ROOTER_PRIVATE_KEY`、`WS_URL`）。
-//!
-//! 编译/运行：`cargo run --bin rooter_deposit`（勿加默认 `precompile-utils` feature，见 `Cargo.toml`）。
-//!
-//! | 变量 | 含义 | 默认 |
-//! |------|------|------|
-//! | `ROOT_DEPOSIT_MULTICALL` | Multicall 合约地址；**未设置**则仍用逐笔 Substrate deposit | 无 |
-//! | `DEPOSIT_MULTICALL_BATCH_SIZE` | 每笔 EVM 交易 batch 的子账户数 | `40` |
-//! | `ROOTER_DEPOSIT_ASSET` | 本批存入的资产符号（如 `usdc`） | `usdc` |
-//! | `ROOTER_DEPOSIT_AMOUNT` | 每个子账户存入数量 | `100000000` |
+//! 编译：`cargo run --bin rooter_deposit`
 
 #![allow(missing_docs)]
 #![allow(dead_code)]
 
 use bytes::Bytes;
-use ethereum::{EIP1559Transaction as EthEip1559, EIP1559TransactionMessage, TransactionAction as EthTxAction};
+use ethereum::{EIP1559Transaction as EthEip1559, TransactionAction as EthTxAction};
 use node_runtime::runtime_types::bounded_collections::bounded_vec::BoundedVec;
-use node_runtime::runtime_types::ethereum::transaction::{EIP1559Transaction, TransactionAction, TransactionV2};
-use node_runtime::runtime_types::primitive_types::U256;
-use secp256k1::ecdsa::RecoveryId;
 use std::str::FromStr;
 use std::sync::LazyLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use subxt::backend::rpc::RpcClient;
+use std::time::Duration;
 use subxt::config::substrate::SubstrateExtrinsicParamsBuilder;
 use subxt::config::{substrate, SubstrateExtrinsicParams};
 use subxt::ext::subxt_core::utils::AccountId20;
@@ -41,12 +21,13 @@ use subxt::{Config, OnlineClient};
 use subxt_signer::eth::Signature;
 use subxt_signer::eth::{DerivationPath, Keypair};
 use subxt_signer::{bip39, DEV_PHRASE};
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
-use log::{debug, info, warn};
+use log::{info, warn};
 use subtx_test::chain_ws;
-use subtx_test::multicall_deposit::{chunk_subaccounts, encode_batch_deposit};
+use subtx_test::evm_rpc::{self, EvmReceipt};
+use subtx_test::multicall_deposit::encode_batch_deposit;
 use subtx_test::shard_run_config::{env_h160_optional, env_string, env_u128, ShardRunConfig};
 
 #[subxt::subxt(
@@ -55,17 +36,29 @@ use subtx_test::shard_run_config::{env_h160_optional, env_string, env_u128, Shar
 )]
 pub mod node_runtime {}
 
-use node_runtime::system::events::remarked::Hash;
+// ── 常量 ─────────────────────────────────────────────────────────────
+
+const LENDING_MARKET_ID: u8 = 1;
+const INIT_QUOTA: u32 = 429467295;
+const PARALLEL_CHAIN_SCAN: usize = 64;
+const RESUME_SKIP_ROOTER_QUOTA: bool = false;
 
 static ROOTER: LazyLock<Keypair> = LazyLock::new(|| {
     let mut sk = [0u8; 32];
-    let a = hex::decode("349f7f21d09265b525c562df697cee56d65fe23fe638bb890dd2213a0cca5dcd").unwrap();
-    sk.copy_from_slice(&a);
+    sk.copy_from_slice(
+        &hex::decode("349f7f21d09265b525c562df697cee56d65fe23fe638bb890dd2213a0cca5dcd").unwrap(),
+    );
     Keypair::from_secret_key(sk).unwrap()
 });
 
-static GLOBAL_API: OnceCell<OnlineClient<EthRuntimeConfig>> = OnceCell::const_new();
-static GLOBAL_RPC: OnceCell<RpcClient> = OnceCell::const_new();
+static PARALLEL_INIT: LazyLock<usize> = LazyLock::new(|| {
+    env_u64("PARALLEL_SUBACCOUNT_INITS", 48).clamp(1, 96) as usize
+});
+
+static INIT_POLL_STEP_MS: LazyLock<u64> =
+    LazyLock::new(|| env_u64("INIT_POLL_STEP_MS", 110).clamp(50, 2000));
+
+static GLOBAL_API: Mutex<Option<OnlineClient<EthRuntimeConfig>>> = Mutex::const_new(None);
 
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub enum EthRuntimeConfig {}
@@ -80,22 +73,6 @@ impl Config for EthRuntimeConfig {
     type AssetId = u32;
 }
 
-async fn get_api() -> anyhow::Result<OnlineClient<EthRuntimeConfig>> {
-    let api = GLOBAL_API
-        .get_or_try_init(|| async {
-            OnlineClient::<EthRuntimeConfig>::from_insecure_url(chain_ws::ws_url()).await
-        })
-        .await?;
-    Ok(api.clone())
-}
-
-async fn get_rpc() -> anyhow::Result<LegacyRpcMethods<EthRuntimeConfig>> {
-    let rpc_client = GLOBAL_RPC
-        .get_or_try_init(|| async { RpcClient::from_insecure_url(chain_ws::ws_url()).await })
-        .await?;
-    Ok(LegacyRpcMethods::<EthRuntimeConfig>::new(rpc_client.clone()))
-}
-
 #[derive(Clone)]
 struct AccountDetail {
     name: String,
@@ -105,13 +82,9 @@ struct AccountDetail {
     order_num: u32,
 }
 
-/// Lending 市场 ID。Multicall / EVM 预编译 `deposit` 在链上固定为 1，positions 检查与之对齐。
-const LENDING_MARKET_ID: u8 = 1;
-
-/// 轮询建子账户最大次数（与 `INIT_POLL_*` 间隔配合）。
-const INIT_POLL_MAX: u32 = 30;
-/// 链上只读扫描 `user_stats` / `subaccount_info` 的并发度（避免长时间无日志像卡死）。
-const PARALLEL_CHAIN_SCAN: usize = 64;
+fn evm_address(aid: &AccountId20) -> H160 {
+    H160(aid.0)
+}
 
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
@@ -120,731 +93,620 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-#[derive(Debug)]
-struct RooterTune {
-    post_quota_sleep_ms: u64,
-    parallel_subaccount_inits: usize,
-    init_poll_first_ms: u64,
-    init_poll_step_ms: u64,
-}
+// ── RPC / API ───────────────────────────────────────────────────────
 
-impl RooterTune {
-    fn from_env() -> Self {
-        Self {
-            post_quota_sleep_ms: env_u64("ROOTER_POST_QUOTA_SLEEP_MS", 20).min(2000),
-            parallel_subaccount_inits: env_u64("PARALLEL_SUBACCOUNT_INITS", 48)
-                .clamp(1, 96) as usize,
-            init_poll_first_ms: env_u64("INIT_POLL_FIRST_MS", 45).min(2000),
-            init_poll_step_ms: env_u64("INIT_POLL_STEP_MS", 110).min(2000),
-        }
+async fn get_api() -> anyhow::Result<OnlineClient<EthRuntimeConfig>> {
+    if let Some(api) = GLOBAL_API.lock().await.as_ref() {
+        return Ok(api.clone());
     }
+    drop(GLOBAL_API.lock().await);
+    let rpc = chain_ws::rpc_client().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let api = OnlineClient::<EthRuntimeConfig>::from_rpc_client(rpc)
+        .await
+        .map_err(|e| anyhow::anyhow!("OnlineClient: {e:?}"))?;
+    *GLOBAL_API.lock().await = Some(api.clone());
+    Ok(api)
 }
 
-static ROOTER_TUNE: LazyLock<RooterTune> = LazyLock::new(RooterTune::from_env);
+async fn get_rpc() -> anyhow::Result<LegacyRpcMethods<EthRuntimeConfig>> {
+    let rpc = chain_ws::rpc_client().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(LegacyRpcMethods::new(rpc))
+}
 
-async fn get_subaccount(user: &Keypair) -> anyhow::Result<Vec<H160>> {
-    let api = get_api().await?;
-    let query = node_runtime::storage()
+// ── 链上读 ───────────────────────────────────────────────────────────
+
+async fn first_subaccount(user: &Keypair) -> Option<H160> {
+    let api = get_api().await.ok()?;
+    let q = node_runtime::storage()
         .subaccount()
         .user_stats_for(user.public_key().to_account_id().0.into());
-    let result = api.storage().at_latest().await?.fetch(&query).await?;
-
-    if let Some(user_stats) = result {
-        return Ok(user_stats.subaccounts);
-    }
-
-    Err(anyhow::anyhow!("user subaccount not found"))
+    let stats = api.storage().at_latest().await.ok()?.fetch(&q).await.ok()??;
+    stats.subaccounts.first().cloned()
 }
 
-async fn first_subaccount_if_any(user: &Keypair) -> Option<H160> {
-    match get_subaccount(user).await {
-        Ok(list) => list.first().cloned(),
-        Err(_) => None,
-    }
+async fn subaccount_order_num(sub: H160) -> anyhow::Result<u32> {
+    let q = node_runtime::storage().subaccount().subaccount_info(sub);
+    let info = get_api()
+        .await?
+        .storage()
+        .at_latest()
+        .await?
+        .fetch(&q)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("subaccount_info missing for {sub:?}"))?;
+    Ok(info.next_order_id.saturating_sub(1))
 }
 
-/// 提交并由用户签名的 `initialize_subaccount`，然后轮询直到出现首个子账户。
-async fn submit_init_and_wait_for_subaccount(user: &Keypair, subaccount_label: &str) -> anyhow::Result<H160> {
-    debug!("initialize_subaccount({subaccount_label})");
-    let api = get_api().await?;
-    let rpc = get_rpc().await?;
-    let nonce = api
-        .tx()
-        .account_nonce(&user.public_key().to_account_id())
+/// `frame_system::Account` 中 `quota == 0` 表示未激活（见 System 预编译文档）。
+async fn system_account_quota(aid: &AccountId20) -> anyhow::Result<u32> {
+    let q = node_runtime::storage().system().account(aid.clone());
+    let info = get_api()
+        .await?
+        .storage()
+        .at_latest()
+        .await?
+        .fetch(&q)
         .await?;
-    let call = node_runtime::tx()
-        .subaccount()
-        .initialize_subaccount(BoundedVec(subaccount_label.as_bytes().to_vec()));
-    let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
-    let signed_tx = api
-        .tx()
-        .create_partial_offline(&call, params)?
-        .sign(user);
-    let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
-    match rpc.author_submit_extrinsic(&call_bytes).await {
-        Ok(_) => debug!("initialize_subaccount tx accepted: {subaccount_label}"),
-        Err(e) => warn!(
-            "initialize_subaccount submit ({subaccount_label}): {e:?}（若链上已存在可忽略，继续轮询读链）"
-        ),
-    }
-
-    let first_ms = ROOTER_TUNE.init_poll_first_ms;
-    let step_ms = ROOTER_TUNE.init_poll_step_ms;
-    tokio::time::sleep(Duration::from_millis(first_ms)).await;
-    if let Some(h) = first_subaccount_if_any(user).await {
-        return Ok(h);
-    }
-    for attempt in 2..=INIT_POLL_MAX {
-        tokio::time::sleep(Duration::from_millis(step_ms)).await;
-        if let Some(h) = first_subaccount_if_any(user).await {
-            debug!("{subaccount_label}: subaccount visible after {attempt} polls");
-            return Ok(h);
-        }
-    }
-
-    anyhow::bail!(
-        "initialize_subaccount 后仍查不到子账户: {subaccount_label}（检查配额激活、RPC、链上 subaccount pallet）"
-    )
+    Ok(info.map(|a| a.quota).unwrap_or(0))
 }
 
-async fn deposit(
-    kp: &Keypair,
-    subaccount: &H160,
-    market_id: u8,
-    asset: &str,
-    amount: u128,
-    nonce: &mut u64,
+async fn has_lending_deposit(sub: H160, asset: &[u8]) -> anyhow::Result<bool> {
+    let q = node_runtime::storage().lending().positions_for(
+        AccountId20 { 0: sub.0 },
+        LENDING_MARKET_ID,
+    );
+    let positions = get_api().await?.storage().at_latest().await?.fetch(&q).await?;
+    Ok(positions.is_some_and(|p| {
+        p.deposits
+            .iter()
+            .any(|(k, amt)| k.0 == LENDING_MARKET_ID && k.1.0.as_slice() == asset && *amt > 0)
+    }))
+}
+
+// ── ROOTER 提交（quota 等）────────────────────────────────────────────
+
+async fn wait_rooter_nonce(root_id: &AccountId20, min_nonce: u64) -> anyhow::Result<()> {
+    let api = get_api().await?;
+    let timeout = env_u64("ROOTER_NONCE_WAIT_MS", 20_000);
+    let step = env_u64("ROOTER_NONCE_POLL_MS", 50).max(10);
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout);
+    loop {
+        if api.tx().account_nonce(root_id).await? >= min_nonce {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "ROOTER nonce 在 {timeout}ms 内未到 {min_nonce}；加大 ROOTER_NONCE_WAIT_MS 或检查出块"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(step)).await;
+    }
+}
+
+async fn submit_root(
+    root_kp: &Keypair,
+    call: &impl subxt::tx::Payload,
+    root_nonce: &mut u64,
 ) -> anyhow::Result<()> {
     let api = get_api().await?;
     let rpc = get_rpc().await?;
+    let root_id = root_kp.public_key().to_account_id();
+    let nonce = *root_nonce;
+    let signed = api
+        .tx()
+        .create_partial_offline(
+            call,
+            SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build(),
+        )?
+        .sign(root_kp);
+    if let Err(e) = rpc
+        .author_submit_extrinsic(&Bytes::from_owner(signed.into_encoded()))
+        .await
+    {
+        if root_tx_already_in_pool(&e) {
+            let next = nonce + 1;
+            wait_rooter_nonce(&root_id, next).await?;
+            *root_nonce = api.tx().account_nonce(&root_id).await?;
+            return Ok(());
+        }
+        return Err(anyhow::anyhow!("{e:?}"));
+    }
+    let next = nonce + 1;
+    wait_rooter_nonce(&root_id, next).await?;
+    *root_nonce = next;
+    Ok(())
+}
 
+fn quota_already_activated(err: &impl std::fmt::Debug) -> bool {
+    let s = format!("{err:?}").to_lowercase();
+    s.contains("accountalreadyactivated") || s.contains("already activated")
+}
+
+fn root_tx_already_in_pool(err: &impl std::fmt::Debug) -> bool {
+    let s = format!("{err:?}").to_lowercase();
+    s.contains("priority is too low")
+        || s.contains("1014")
+        || s.contains("already imported")
+        || s.contains("1013")
+}
+
+async fn ensure_quota(root_kp: &Keypair, aid: AccountId20, root_nonce: &mut u64) -> anyhow::Result<()> {
+    let addr = evm_address(&aid);
+    let mut quota = system_account_quota(&aid).await?;
+    if quota >= INIT_QUOTA {
+        return Ok(());
+    }
+    if quota == 0 {
+        let activate = node_runtime::tx().quota().activate_account(aid.clone());
+        match submit_root(root_kp, &activate, root_nonce).await {
+            Ok(()) => {}
+            Err(e) if quota_already_activated(&e) => {}
+            Err(e) if root_tx_already_in_pool(&e) => {
+                let root_id = root_kp.public_key().to_account_id();
+                let pending = *root_nonce;
+                wait_rooter_nonce(&root_id, pending + 1).await?;
+                *root_nonce = get_api().await?.tx().account_nonce(&root_id).await?;
+            }
+            Err(e) => return Err(anyhow::anyhow!("activate_account {addr:?}: {e:#}")),
+        }
+        quota = system_account_quota(&aid).await?;
+        if quota == 0 {
+            anyhow::bail!("activate_account 后 quota 仍为 0: {addr:?}");
+        }
+    }
+    if quota >= INIT_QUOTA {
+        return Ok(());
+    }
+    let add = node_runtime::tx().quota().manager_add_quota(aid, INIT_QUOTA);
+    submit_root(root_kp, &add, root_nonce).await
+}
+
+// ── 用户 initialize_subaccount ────────────────────────────────────────
+
+async fn poll_until_subaccount(user: &Keypair, label: &str, timeout_ms: u64) -> anyhow::Result<H160> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if let Some(h) = first_subaccount(user).await {
+            return Ok(h);
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(*INIT_POLL_STEP_MS)).await;
+    }
+    Err(anyhow::anyhow!("轮询 {timeout_ms}ms 仍无子账户: {label}"))
+}
+
+async fn initialize_subaccount(user: &Keypair, label: &str) -> anyhow::Result<H160> {
+    let addr = evm_address(&user.public_key().to_account_id());
+    if let Some(h) = first_subaccount(user).await {
+        return Ok(h);
+    }
+    let api = get_api().await?;
+    let rpc = get_rpc().await?;
+    let nonce = api.tx().account_nonce(&user.public_key().to_account_id()).await?;
+    let call = node_runtime::tx().subaccount().initialize_subaccount(BoundedVec(
+        label.as_bytes().to_vec(),
+    ));
+    let signed = api
+        .tx()
+        .create_partial_offline(
+            &call,
+            SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build(),
+        )?
+        .sign(user);
+    match rpc
+        .author_submit_extrinsic(&Bytes::from_owner(signed.into_encoded()))
+        .await
+    {
+        Ok(_) => {}
+        Err(e) => warn!("initialize_subaccount submit {addr:?} ({label}): {e:?}"),
+    }
+    poll_until_subaccount(user, label, env_u64("INIT_POLL_MS", 8_000))
+        .await
+        .map_err(|_| anyhow::anyhow!("initialize 后仍无子账户: {addr:?} ({label})（检查 quota / RPC）"))
+}
+
+// ── 存款 ─────────────────────────────────────────────────────────────
+
+async fn deposit_substrate(
+    root_kp: &Keypair,
+    sub: H160,
+    asset: &str,
+    amount: u128,
+    root_nonce: &mut u64,
+) -> anyhow::Result<()> {
+    let api = get_api().await?;
+    let rpc = get_rpc().await?;
     let call = node_runtime::tx().lending().deposit(
         None,
-        *subaccount,
-        market_id,
+        sub,
+        LENDING_MARKET_ID,
         BoundedVec(asset.as_bytes().to_vec()),
         amount,
     );
-    let params = SubstrateExtrinsicParamsBuilder::new().nonce(*nonce).build();
-    let signed_tx = api.tx().create_partial_offline(&call, params)?.sign(kp);
-    let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
-
-    let signer_id = kp.public_key().to_account_id();
-    match rpc.author_submit_extrinsic(&call_bytes).await {
-        Ok(_) => {
-            debug!(
-                "deposit submitted: owner={:?}, subaccount={:?}, market_id={}, asset={}, amount={}",
-                hex::encode(&kp.public_key().to_account_id().0),
-                subaccount,
-                market_id,
-                asset,
-                amount
-            );
-            // 与历史 `testnet_sharded::deposit` 一致：该路径上 ROOTER 单笔 deposit 后本地游标前进 2。
-            *nonce = nonce.saturating_add(2);
-        }
+    let signed = api
+        .tx()
+        .create_partial_offline(
+            &call,
+            SubstrateExtrinsicParamsBuilder::new().nonce(*root_nonce).build(),
+        )?
+        .sign(root_kp);
+    match rpc
+        .author_submit_extrinsic(&Bytes::from_owner(signed.into_encoded()))
+        .await
+    {
+        Ok(_) => *root_nonce = root_nonce.saturating_add(2),
         Err(e) => {
-            warn!("Failed to deposit for subaccount {:?}: {:?}", subaccount, e);
-            *nonce = api.tx().account_nonce(&signer_id).await.unwrap_or(*nonce);
+            warn!("deposit {sub:?}: {e:?}");
+            *root_nonce = api
+                .tx()
+                .account_nonce(&root_kp.public_key().to_account_id())
+                .await
+                .unwrap_or(*root_nonce);
         }
     }
     Ok(())
 }
 
-fn unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_millis() as u64
-}
-
-fn build_eip1559_tx_to_v2(tx: EthEip1559, signer: &Keypair) -> anyhow::Result<TransactionV2> {
-    let tx_msg = EIP1559TransactionMessage::from(tx);
-    let sk = signer.clone().secret_key();
-    let secret = secp256k1::SecretKey::from_byte_array(&sk.into())?;
-    let signing_message = secp256k1::Message::from_digest(tx_msg.hash().to_fixed_bytes());
-    let signature = secp256k1::Secp256k1::new().sign_ecdsa_recoverable(&signing_message, &secret);
-    let (recid, rs) = signature.serialize_compact();
-    let r = Hash::from_slice(&rs[0..32]);
-    let s = Hash::from_slice(&rs[32..64]);
-
-    let eip1559 = EIP1559Transaction {
-        chain_id: tx_msg.chain_id,
-        nonce: U256(tx_msg.nonce.0),
-        max_priority_fee_per_gas: U256(tx_msg.max_priority_fee_per_gas.0),
-        max_fee_per_gas: U256(tx_msg.max_fee_per_gas.0),
-        gas_limit: U256(tx_msg.gas_limit.0),
-        action: match tx_msg.action {
-            EthTxAction::Call(addr) => TransactionAction::Call(addr.0.into()),
-            _ => anyhow::bail!("仅支持 Call 类型 EVM 交易"),
-        },
-        value: U256(tx_msg.value.0),
-        input: tx_msg.input.clone(),
-        access_list: vec![],
-        odd_y_parity: recid != RecoveryId::Zero,
-        r: r.clone(),
-        s: s.clone(),
-    };
-    Ok(TransactionV2::EIP1559(eip1559))
-}
-
-/// 通过 Multicall 合约在一笔 `ethereum.transact` 内对多个子账户 `deposit`。
-async fn deposit_batch_via_multicall(
+async fn deposit_batch_multicall(
     root_kp: &Keypair,
     multicall: H160,
-    subaccounts: &[H160],
+    subs: &[H160],
     asset: &str,
     amount: u128,
-    evm_nonce: u64,
-) -> anyhow::Result<()> {
-    if subaccounts.is_empty() {
-        return Ok(());
-    }
+    evm_nonce: &mut u64,
+) -> anyhow::Result<EvmReceipt> {
+    anyhow::ensure!(!subs.is_empty(), "empty multicall batch");
     let api = get_api().await?;
-    let rpc = get_rpc().await?;
-    let chain_id_query = node_runtime::storage().evm_chain_id().chain_id();
+    let rpc = chain_ws::rpc_client().await.map_err(|e| anyhow::anyhow!("{e}"))?;
     let chain_id = api
         .storage()
         .at_latest()
         .await?
-        .fetch(&chain_id_query)
+        .fetch(&node_runtime::storage().evm_chain_id().chain_id())
         .await?
         .ok_or_else(|| anyhow::anyhow!("无法读取 evm_chain_id"))?;
 
-    let calldata = encode_batch_deposit(subaccounts, asset.as_bytes(), amount);
-    let gas_limit = 200_000u64.saturating_add(120_000u64.saturating_mul(subaccounts.len() as u64));
+    let root_h160: H160 = root_kp.public_key().to_account_id().0.into();
+    let on_chain = evm_rpc::eth_transaction_count(&rpc, root_h160).await?;
+    if on_chain > *evm_nonce {
+        warn!("EVM nonce 对齐 {} -> {on_chain}", *evm_nonce);
+        *evm_nonce = on_chain;
+    }
 
+    let gas_limit = 200_000u64
+        + env_u64("ROOTER_MULTICALL_GAS_PER_ACCOUNT", 180_000) * subs.len() as u64;
     let eip1559 = EthEip1559 {
         chain_id,
-        nonce: evm_nonce.into(),
-        max_priority_fee_per_gas: 1_500_000_000u64.into(),
-        max_fee_per_gas: 4_500_000_000u64.into(),
+        nonce: (*evm_nonce).into(),
+        max_priority_fee_per_gas: env_u64("ROOTER_EVM_MAX_PRIORITY_FEE_PER_GAS", 0).into(),
+        max_fee_per_gas: env_u64("ROOTER_EVM_MAX_FEE_PER_GAS", 0).into(),
         gas_limit: gas_limit.into(),
         action: EthTxAction::Call(multicall.0.into()),
         value: 0u64.into(),
-        input: calldata,
+        input: encode_batch_deposit(subs, asset.as_bytes(), amount),
         access_list: vec![],
         odd_y_parity: false,
         r: Default::default(),
         s: Default::default(),
     };
-    let transaction = build_eip1559_tx_to_v2(eip1559, root_kp)?;
-    let source_acc: H160 = root_kp.public_key().to_account_id().0.into();
-    let call = node_runtime::tx()
-        .ethereum()
-        .transact(transaction, source_acc);
-    let params = SubstrateExtrinsicParamsBuilder::new()
-        .nonce(evm_nonce)
-        .build();
-    let signed = api.tx().create_partial_offline(&call, params)?.sign(root_kp);
-    let bytes = Bytes::from_owner(signed.into_encoded());
-    match rpc.author_submit_extrinsic(&bytes).await {
-        Ok(_) => {
-            debug!(
-                "multicall batchDeposit ok: n={} asset={} amount={} multicall={:?}",
-                subaccounts.len(),
-                asset,
-                amount,
-                multicall
-            );
-        }
-        Err(e) => {
-            warn!(
-                "multicall batchDeposit 提交失败 (n={}): {:?}",
-                subaccounts.len(),
-                e
-            );
-            return Err(e.into());
-        }
-    }
-    Ok(())
-}
-
-/// 子账户在 lending market 1 是否已有该资产的存款（有则跳过本次 deposit）。
-async fn check_deposit(account: &AccountDetail, asset: &[u8]) -> anyhow::Result<bool> {
-    let api = get_api().await?;
-    let position_query = node_runtime::storage().lending().positions_for(
-        AccountId20 {
-            0: account.subaccount.clone().0,
-        },
-        LENDING_MARKET_ID,
-    );
-    let positions = api.storage().at_latest().await?.fetch(&position_query).await?;
-    let skip = positions.is_some_and(|p| {
-        p.deposits.iter().any(|(key, amount)| {
-            key.0 == LENDING_MARKET_ID && key.1.0.as_slice() == asset && *amount > 0
-        })
-    });
-    Ok(skip)
-}
-
-async fn create_sharded_test_accounts(
-    first_addr_index: u32,
-    count: u32,
-) -> anyhow::Result<Vec<AccountDetail>> {
-    info!("rooter_deposit: creating key list first_addr_index={first_addr_index}, count={count}");
-    let mut result = Vec::new();
-    let _client = get_api().await?;
-    let _rpc = get_rpc().await?;
-
-    for i in 0..count {
-        let addr_idx = first_addr_index + i;
-        let kp = Keypair::from_phrase(
-            &bip39::Mnemonic::from_str(DEV_PHRASE)?,
-            None,
-            DerivationPath::eth(0, addr_idx),
-        )?;
-        let name = format!("test_user_{addr_idx}");
-        debug!(
-            "[{i}] account init, address: {:?}",
-            hex::encode(&kp.public_key().to_account_id().0)
-        );
-        result.push(AccountDetail {
-            name,
-            kp,
-            subaccount: Default::default(),
-            order_num: 0,
-        });
-    }
-    Ok(result)
-}
-
-const INIT_QUOTA: u32 = 429467295;
-
-/// 未激活的 EVM 账户无法签原生 pallet 调用；由 ROOTER 代提 `activate_account` 与 `manager_add_quota`。
-/// 与 `main.rs::create_extra_test_accounts` 相同：`let mut nonce = api.tx().account_nonce(ROOTER)`，仅 **`submit` 成功时 `nonce += 1`**；失败重试前重新读链上 nonce。本函数不接收、不修改 `rooter_deposit::main` 中的 `root_nonce`。
-async fn ensure_quota_for_test_user(root_kp: &Keypair, user: &Keypair) -> anyhow::Result<()> {
-    let api = get_api().await?;
-    let rpc = get_rpc().await?;
-    let aid = user.public_key().to_account_id();
-    let root_id = root_kp.public_key().to_account_id();
-
-    let mut nonce = api.tx().account_nonce(&root_id).await?;
-
-    for attempt in 0u32..4 {
-        let call = node_runtime::tx().quota().activate_account(aid.clone());
-        let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
-        let signed_tx = api.tx().create_partial_offline(&call, params)?.sign(root_kp);
-        let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
-        match rpc.author_submit_extrinsic(&call_bytes).await {
-            Ok(_) => {
-                nonce += 1;
-                debug!("activate_account ok for {:?}", aid);
-                break;
-            }
-            Err(e) => {
-                let esl = format!("{e:?}").to_lowercase();
-                if esl.contains("alreadyactivated") || esl.contains("already") {
-                    debug!("activate_account skip (already): {:?}", aid);
-                    break;
-                }
-                warn!("Error submitting activate_account: {e:?}");
-                if attempt + 1 >= 4 {
-                    anyhow::bail!(
-                        "activate_account 在 4 次尝试后仍未成功（{:?}）；未激活则后续 initialize_subaccount 会报 Invalid signing address",
-                        aid
-                    );
-                }
-                nonce = api.tx().account_nonce(&root_id).await?;
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        }
-    }
-
-    for mgr_try in 0u32..5 {
-        let call = node_runtime::tx()
-            .quota()
-            .manager_add_quota(aid.clone(), INIT_QUOTA);
-        let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
-        let signed_tx = api.tx().create_partial_offline(&call, params)?.sign(root_kp);
-        let call_bytes = Bytes::from_owner(signed_tx.into_encoded());
-        match rpc.author_submit_extrinsic(&call_bytes).await {
-            Ok(_) => {
-                nonce += 1;
-                debug!("manager_add_quota ok");
-                break;
-            }
-            Err(e) => {
-                let esl = format!("{e:?}").to_lowercase();
-                if esl.contains("already")
-                    || esl.contains("duplicate")
-                    || esl.contains("exist")
-                {
-                    debug!("manager_add_quota 视为已满足（链上提示）: {e:?}");
-                    break;
-                }
-                warn!("Error submitting add quota for account: {e:?}");
-                if mgr_try + 1 >= 5 {
-                    anyhow::bail!(
-                        "manager_add_quota 在 5 次尝试后仍未成功（{:?}）；未加配额则后续 initialize_subaccount 可能报 Invalid signing address",
-                        aid
-                    );
-                }
-                nonce = api.tx().account_nonce(&root_id).await?;
-                tokio::time::sleep(Duration::from_millis(400)).await;
-            }
-        }
-    }
-
-    tokio::time::sleep(Duration::from_millis(ROOTER_TUNE.post_quota_sleep_ms)).await;
-    let _ = nonce;
-    Ok(())
-}
-
-#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
-async fn main() -> anyhow::Result<()> {
-    env_logger::init();
-    let cfg = ShardRunConfig::load()?;
-    let deposit_asset = env_string("ROOTER_DEPOSIT_ASSET", "usdc");
-    if deposit_asset.is_empty() {
-        anyhow::bail!("ROOTER_DEPOSIT_ASSET 不能为空");
-    }
-    let deposit_amount = env_u128("ROOTER_DEPOSIT_AMOUNT", 100_000_000);
-    if deposit_amount == 0 {
-        anyhow::bail!("ROOTER_DEPOSIT_AMOUNT 必须 > 0");
-    }
-    let multicall_addr = env_h160_optional("ROOT_DEPOSIT_MULTICALL")?;
-    let deposit_batch_size = env_u64("DEPOSIT_MULTICALL_BATCH_SIZE", 40).clamp(1, 200) as usize;
-    info!("rooter_deposit {}", cfg.summary());
-    info!(
-        "rooter_deposit 性能参数（可用环境变量覆盖，见 crate 顶部说明）: {:?}",
-        &*ROOTER_TUNE
-    );
-    info!(
-        "deposit 目标: asset={:?} amount={} (lending market_id={})",
-        deposit_asset, deposit_amount, LENDING_MARKET_ID
-    );
-    if let Some(mc) = multicall_addr {
-        info!(
-            "deposit 模式: Multicall batch（合约 {:?}，每批最多 {} 户）",
-            mc, deposit_batch_size
-        );
+    let (raw, _) = evm_rpc::build_signed_raw_eip1559(eip1559, root_kp)?;
+    let tx_hash = evm_rpc::eth_send_raw_transaction(&rpc, &raw).await?;
+    let receipt = evm_rpc::wait_transaction_receipt(&rpc, tx_hash).await?;
+    if receipt.success {
+        *evm_nonce += 1;
+        Ok(receipt)
     } else {
-        info!(
-            "deposit 模式: 逐笔 Substrate lending.deposit（设置 ROOT_DEPOSIT_MULTICALL 可启用 Multicall）"
-        );
+        anyhow::bail!("Multicall revert {tx_hash:?} block={:?}", receipt.block_number)
     }
-    chain_ws::init(cfg.ws_url.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+}
 
-    tokio::time::sleep(Duration::from_millis(2000)).await;
+async fn wait_batch_deposits(subs: &[H160], asset: &[u8]) -> anyhow::Result<Vec<H160>> {
+    let timeout = env_u64("ROOTER_MULTICALL_SETTLE_MS", 8_000);
+    let step = env_u64("ROOTER_MULTICALL_POLL_MS", 400).max(100);
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout);
+    loop {
+        let missing: Vec<_> = {
+            let mut m = Vec::new();
+            for &s in subs {
+                if !has_lending_deposit(s, asset).await? {
+                    m.push(s);
+                }
+            }
+            m
+        };
+        if missing.is_empty() {
+            return Ok(vec![]);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(missing);
+        }
+        tokio::time::sleep(Duration::from_millis(step)).await;
+    }
+}
 
-    let mut accounts = create_sharded_test_accounts(cfg.first_addr_index, cfg.account_count).await?;
+async fn run_multicall_deposits(
+    root_kp: &Keypair,
+    multicall: H160,
+    accounts: &[AccountDetail],
+    need: &[usize],
+    asset: &str,
+    amount: u128,
+    batch_size: usize,
+    root_nonce: &mut u64,
+) -> anyhow::Result<u32> {
+    ensure_quota(root_kp, AccountId20 { 0: multicall.0 }, root_nonce).await?;
 
-    let root_kp = ROOTER.clone();
-    let api = get_api().await?;
-    let root_id = root_kp.public_key().to_account_id();
-    let mut root_nonce = api.tx().account_nonce(&root_id).await?;
+    let rpc = chain_ws::rpc_client().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let root_h160: H160 = root_kp.public_key().to_account_id().0.into();
+    let mut evm_nonce = evm_rpc::eth_transaction_count(&rpc, root_h160).await?;
+    let evm_start = evm_nonce;
+
+    let mut pending: Vec<usize> = need.to_vec();
+    let mut batch_size = batch_size.clamp(1, 50);
+    let mut confirmed = 0u32;
+    let mut evm_txs = 0u32;
+    let asset_b = asset.as_bytes();
+
     info!(
-        "ROOTER Substrate nonce 起点 = {}（链上 account_nonce）",
-        root_nonce
+        "Multicall: {} 户 {:?} batch≤{} contract={multicall:?} evm_nonce={evm_start}",
+        need.len(),
+        asset,
+        batch_size
     );
 
-    /// 断线重跑：若 **quota 已整段跑完**、只需从「并行 initialize_subaccount」接着跑，改为 `true` 以跳过 ROOTER `activate` / `manager_add_quota` 循环。
-    /// **仍会执行上面的链上扫描**，以正确划分 `need_init`。整段 `rooter_deposit` 跑通后请改回 `false`。
-    const RESUME_SKIP_ROOTER_QUOTA: bool = false;
+    while !pending.is_empty() {
+        let n_chunks = pending.len().div_ceil(batch_size);
+        let mut still = Vec::new();
+        for (chunk_i, chunk) in pending.chunks(batch_size).enumerate() {
+            let subs: Vec<H160> = chunk.iter().map(|&i| accounts[i].subaccount).collect();
+            if deposit_batch_multicall(root_kp, multicall, &subs, asset, amount, &mut evm_nonce)
+                .await
+                .is_err()
+            {
+                warn!("multicall EVM {}/{} 失败", chunk_i + 1, n_chunks);
+                still.extend(chunk.iter().copied());
+                evm_txs += 1;
+                continue;
+            }
+            evm_txs += 1;
+            let missing = wait_batch_deposits(&subs, asset_b).await?;
+            confirmed += (chunk.len() - missing.len()) as u32;
+            for &i in chunk {
+                if missing.contains(&accounts[i].subaccount) {
+                    still.push(i);
+                }
+            }
+        }
+        if still.len() == pending.len() && batch_size > 1 {
+            batch_size = (batch_size / 2).max(1);
+            warn!("Multicall 无进展，batch_size -> {batch_size}");
+            continue;
+        }
+        if still.len() == pending.len() && batch_size == 1 {
+            anyhow::bail!(
+                "Multicall 失败 {} 户；确认合约 {multicall:?} 有足够 USDC 且 ROOTER 为 owner",
+                still.len()
+            );
+        }
+        pending = still;
+    }
 
+    info!(
+        "Multicall 完成 {}/{} 户, {evm_txs} 笔 EVM (nonce {evm_start}..={})",
+        confirmed,
+        need.len(),
+        evm_nonce.saturating_sub(1)
+    );
+    Ok(confirmed)
+}
+
+// ── 账户准备（扫描 / quota / initialize）──────────────────────────────
+
+fn create_test_accounts(first: u32, count: u32) -> anyhow::Result<Vec<AccountDetail>> {
+    (0..count)
+        .map(|i| {
+            let addr_idx = first + i;
+            let kp = Keypair::from_phrase(
+                &bip39::Mnemonic::from_str(DEV_PHRASE)?,
+                None,
+                DerivationPath::eth(0, addr_idx),
+            )?;
+            Ok(AccountDetail {
+                name: format!("test_user_{addr_idx}"),
+                kp,
+                subaccount: Default::default(),
+                order_num: 0,
+            })
+        })
+        .collect()
+}
+
+/// 并发扫描：返回每个账户是否已有子账户地址。
+async fn scan_existing_subaccounts(accounts: &[AccountDetail]) -> Vec<Option<H160>> {
     let n = accounts.len();
-    info!(
-        "链上扫描子账户是否存在（{} 个账户，每批并发 {}）…",
-        n,
-        PARALLEL_CHAIN_SCAN
-    );
-    let mut first_sub: Vec<Option<H160>> = vec![None; n];
-    for chunk_start in (0..n).step_by(PARALLEL_CHAIN_SCAN) {
-        let end = (chunk_start + PARALLEL_CHAIN_SCAN).min(n);
+    let mut out = vec![None; n];
+    for start in (0..n).step_by(PARALLEL_CHAIN_SCAN) {
+        let end = (start + PARALLEL_CHAIN_SCAN).min(n);
         let mut set = JoinSet::new();
-        for i in chunk_start..end {
+        for i in start..end {
             let kp = accounts[i].kp.clone();
             set.spawn(async move {
-                let sub = first_subaccount_if_any(&kp).await;
+                let sub = first_subaccount(&kp).await;
                 Ok::<_, anyhow::Error>((i, sub))
             });
         }
-        while let Some(joined) = set.join_next().await {
-            let (i, sub) = joined.map_err(|e| anyhow::anyhow!("扫描任务 join: {e}"))??;
-            first_sub[i] = sub;
-        }
-        info!("扫描进度 {}/{}", end, n);
-    }
-
-    let mut already_have_sub: Vec<(usize, H160)> = Vec::new();
-    let mut need_init: Vec<(usize, Keypair, String)> = Vec::new();
-    for i in 0..n {
-        if let Some(subaccount) = first_sub[i].clone() {
-            already_have_sub.push((i, subaccount));
-        } else {
-            need_init.push((
-                i,
-                accounts[i].kp.clone(),
-                accounts[i].name.clone(),
-            ));
+        while let Some(r) = set.join_next().await {
+            let (i, sub) = r.unwrap().unwrap();
+            out[i] = sub;
         }
     }
+    out
+}
 
-    if !already_have_sub.is_empty() {
-        info!(
-            "拉取已有子账户的 subaccount_info（{} 条，每批并发 {}）…",
-            already_have_sub.len(),
-            PARALLEL_CHAIN_SCAN
-        );
-        for chunk in already_have_sub.chunks(PARALLEL_CHAIN_SCAN) {
-            let mut set = JoinSet::new();
-            for (i, subaccount) in chunk {
-                let i = *i;
-                let subaccount = subaccount.clone();
-                let name = accounts[i].name.clone();
-                let kp = accounts[i].kp.clone();
-                set.spawn(async move {
-                    let subaccount_info_query =
-                        node_runtime::storage().subaccount().subaccount_info(subaccount.clone());
-                    let subaccount_info = get_api()
-                        .await?
-                        .storage()
-                        .at_latest()
-                        .await?
-                        .fetch(&subaccount_info_query)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("subaccount_info missing for {:?}", name))?;
-                    Ok::<_, anyhow::Error>((
-                        i,
-                        AccountDetail {
-                            name,
-                            kp,
-                            subaccount,
-                            order_num: subaccount_info.next_order_id.saturating_sub(1),
-                        },
-                    ))
-                });
-            }
-            while let Some(joined) = set.join_next().await {
-                let (i, detail) = joined.map_err(|e| anyhow::anyhow!("subaccount_info join: {e}"))??;
-                accounts[i] = detail;
+async fn fill_subaccount_info(accounts: &mut [AccountDetail], sub: H160, idx: usize) -> anyhow::Result<()> {
+    accounts[idx].subaccount = sub;
+    accounts[idx].order_num = subaccount_order_num(sub).await?;
+    Ok(())
+}
+
+async fn quota_and_initialize(
+    accounts: &mut [AccountDetail],
+    need_init: &[(usize, Keypair, String)],
+    root_kp: &Keypair,
+    root_nonce: &mut u64,
+) -> anyhow::Result<()> {
+    if need_init.is_empty() {
+        return Ok(());
+    }
+    info!("quota: {} 户", need_init.len());
+    if !RESUME_SKIP_ROOTER_QUOTA {
+        let total = need_init.len();
+        for (n, (_, kp, _)) in need_init.iter().enumerate() {
+            ensure_quota(root_kp, kp.public_key().to_account_id(), root_nonce).await?;
+            if (n + 1) % 10 == 0 || n + 1 == total {
+                info!("quota 进度 {}/{}", n + 1, total);
             }
         }
     }
 
-    let n_need = need_init.len();
-    let par_init = ROOTER_TUNE.parallel_subaccount_inits;
-    info!(
-        "子账户: 链上已有 {} 个，需新建 {} 个（initialize 并行度 {}）",
-        accounts.len() - n_need,
-        n_need,
-        par_init
-    );
+    let settle = env_u64("ROOTER_POST_QUOTA_BATCH_SETTLE_MS", 1500);
+    tokio::time::sleep(Duration::from_millis(settle)).await;
 
-    if n_need > 0 {
-        info!(
-            "ROOTER activate + manager_add_quota：每个待建账户 2 笔、必须串行（ROOTER 单 nonce 流），共 {} 个账户（约 {} 笔 submit）；post_quota_sleep_ms={}",
-            n_need,
-            n_need.saturating_mul(2),
-            ROOTER_TUNE.post_quota_sleep_ms
-        );
-        info!("若此阶段过慢，属 RPC/出块节奏限制；已尽量压低每笔后的 sleep，可用 ROOTER_POST_QUOTA_SLEEP_MS 再调");
-
-        if RESUME_SKIP_ROOTER_QUOTA {
-            info!(
-                "RESUME_SKIP_ROOTER_QUOTA：跳过 activate/manager_add_quota；仅对齐 ROOTER nonce 后进入 initialize_subaccount"
-            );
-            root_nonce = api.tx().account_nonce(&root_id).await?;
-            info!("对齐后 ROOTER nonce = {}（account_nonce）", root_nonce);
-        } else {
-            root_nonce = api.tx().account_nonce(&root_id).await?;
-            info!(
-                "quota 开始前 ROOTER nonce = {}（account_nonce，避免长扫描后游标过时）",
-                root_nonce
-            );
-            for (qi, (_, kp, _)) in need_init.iter().enumerate() {
-                if qi == 0 || (qi + 1) % 25 == 0 || qi + 1 == n_need {
-                    info!("quota 进度 {}/{}", qi + 1, n_need);
-                }
-                ensure_quota_for_test_user(&root_kp, kp).await?;
-            }
-            root_nonce = api.tx().account_nonce(&root_id).await?;
-            info!(
-                "quota 串行结束，ROOTER nonce 已按链上对齐 -> {}（供后续 deposit）",
-                root_nonce
-            );
-        }
-    }
-    if !need_init.is_empty() {
-        if RESUME_SKIP_ROOTER_QUOTA {
-            info!("RESUME：已跳过 quota，等待 400ms 后并行 initialize_subaccount");
-        } else {
-            info!("quota 阶段结束，等待 400ms 后并行 initialize_subaccount");
-        }
-        tokio::time::sleep(Duration::from_millis(400)).await;
-    }
-
-    let total_init_batches = (n_need + par_init - 1) / par_init;
-    let mut batch_idx = 0u32;
-    for chunk in need_init.chunks(par_init) {
-        batch_idx += 1;
-        info!(
-            "initialize_subaccount 并行批 {}/{}（本批 {} 个）",
-            batch_idx,
-            total_init_batches.max(1),
-            chunk.len()
-        );
+    let par = *PARALLEL_INIT;
+    info!("initialize: {} 户, 并行 {par}", need_init.len());
+    for chunk in need_init.chunks(par) {
         let mut set = JoinSet::new();
         for (idx, kp, name) in chunk {
             let kp = kp.clone();
             let name = name.clone();
             let idx = *idx;
             set.spawn(async move {
-                let sub = submit_init_and_wait_for_subaccount(&kp, &name).await?;
+                let sub = initialize_subaccount(&kp, &name).await?;
                 Ok::<_, anyhow::Error>((idx, sub))
             });
         }
-        let mut init_out: Vec<(usize, H160)> = Vec::with_capacity(chunk.len());
-        while let Some(joined) = set.join_next().await {
-            init_out.push(joined.map_err(|e| anyhow::anyhow!("并行任务 join: {e}"))??);
+        while let Some(r) = set.join_next().await {
+            let (idx, sub) = r.map_err(|e| anyhow::anyhow!("initialize join: {e}"))??;
+            fill_subaccount_info(accounts, sub, idx).await?;
         }
-        let mut fetch_set = JoinSet::new();
-        for (idx, sub) in init_out {
-            fetch_set.spawn(async move {
-                let subaccount_info_query =
-                    node_runtime::storage().subaccount().subaccount_info(sub.clone());
-                let subaccount_info = get_api()
-                    .await?
-                    .storage()
-                    .at_latest()
-                    .await?
-                    .fetch(&subaccount_info_query)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("subaccount_info missing for index {idx}"))?;
-                Ok::<_, anyhow::Error>((
-                    idx,
-                    sub,
-                    subaccount_info.next_order_id.saturating_sub(1),
-                ))
-            });
-        }
-        let mut finished_in_batch = 0u32;
-        while let Some(joined) = fetch_set.join_next().await {
-            let (idx, sub, order_num) =
-                joined.map_err(|e| anyhow::anyhow!("subaccount_info 并行拉取 join: {e}"))??;
-            let (name, kp) = (accounts[idx].name.clone(), accounts[idx].kp.clone());
-            accounts[idx] = AccountDetail {
-                name,
-                kp,
-                subaccount: sub,
-                order_num,
-            };
-            finished_in_batch += 1;
-        }
-        info!(
-            "并行批 {}/{} 内 {} 个子账户已写入 accounts",
-            batch_idx,
-            total_init_batches.max(1),
-            finished_in_batch
-        );
     }
+    Ok(())
+}
 
-    let n_acct = accounts.len();
-    info!(
-        "ROOTER lending deposit：先并行检查是否已有 {:?} 存款（{} 个账户，每批并发 {}）",
-        deposit_asset,
-        n_acct,
-        PARALLEL_CHAIN_SCAN
-    );
-    let mut need_deposit: Vec<usize> = Vec::new();
-    let asset_bytes = deposit_asset.as_bytes().to_vec();
-    for chunk_start in (0..n_acct).step_by(PARALLEL_CHAIN_SCAN) {
-        let end = (chunk_start + PARALLEL_CHAIN_SCAN).min(n_acct);
+async fn indices_needing_deposit(accounts: &[AccountDetail], asset: &[u8]) -> anyhow::Result<Vec<usize>> {
+    let n = accounts.len();
+    let mut need = Vec::new();
+    for start in (0..n).step_by(PARALLEL_CHAIN_SCAN) {
+        let end = (start + PARALLEL_CHAIN_SCAN).min(n);
         let mut set = JoinSet::new();
-        for i in chunk_start..end {
-            let x = accounts[i].clone();
-            let asset_bytes = asset_bytes.clone();
+        for i in start..end {
+            let acc = accounts[i].clone();
+            let asset = asset.to_vec();
             set.spawn(async move {
-                let skip = check_deposit(&x, &asset_bytes).await?;
+                let skip = has_lending_deposit(acc.subaccount, &asset).await?;
                 Ok::<_, anyhow::Error>((i, skip))
             });
         }
-        while let Some(joined) = set.join_next().await {
-            let (i, skip) = joined.map_err(|e| anyhow::anyhow!("deposit 检查任务 join: {e}"))??;
+        while let Some(r) = set.join_next().await {
+            let (i, skip) = r.map_err(|e| anyhow::anyhow!("deposit 检查 join: {e}"))??;
             if !skip {
-                need_deposit.push(i);
+                need.push(i);
             }
         }
-        info!("deposit positions 检查进度 {}/{}", end, n_acct);
     }
-    need_deposit.sort_unstable();
-    let skipped = (n_acct - need_deposit.len()) as u32;
-    let n_dep = need_deposit.len();
+    need.sort_unstable();
+    Ok(need)
+}
+
+// ── main ─────────────────────────────────────────────────────────────
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
+async fn main() -> anyhow::Result<()> {
+    env_logger::init();
+    let cfg = ShardRunConfig::load()?;
+    let asset = env_string("ROOTER_DEPOSIT_ASSET", "usdc");
+    anyhow::ensure!(!asset.is_empty(), "ROOTER_DEPOSIT_ASSET 不能为空");
+    let amount = env_u128("ROOTER_DEPOSIT_AMOUNT", 100_000_000);
+    anyhow::ensure!(amount > 0, "ROOTER_DEPOSIT_AMOUNT 必须 > 0");
+    let multicall = env_h160_optional("ROOT_DEPOSIT_MULTICALL")?;
+    let mc_batch = env_u64("DEPOSIT_MULTICALL_BATCH_SIZE", 25).clamp(1, 100) as usize;
+
+    info!("rooter_deposit {} | {asset:?} amount={amount}", cfg.summary());
+    if let Some(mc) = multicall {
+        info!("deposit: Multicall {mc:?} batch={mc_batch}");
+    }
+
+    chain_ws::init(cfg.ws_url.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    get_api().await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut accounts = create_test_accounts(cfg.first_addr_index, cfg.account_count)?;
+    let root_kp = ROOTER.clone();
+    let mut root_nonce = get_api()
+        .await?
+        .tx()
+        .account_nonce(&root_kp.public_key().to_account_id())
+        .await?;
+
+    // 1. 扫描并划分需 initialize 的账户
+    info!("扫描子账户 ({} 户)…", accounts.len());
+    let existing = scan_existing_subaccounts(&accounts).await;
+    let mut need_init = Vec::new();
+    for (i, sub) in existing.into_iter().enumerate() {
+        if let Some(s) = sub {
+            fill_subaccount_info(&mut accounts, s, i).await?;
+        } else {
+            need_init.push((i, accounts[i].kp.clone(), accounts[i].name.clone()));
+        }
+    }
     info!(
-        "positions 检查结束（asset={:?}）：将新发起 deposit {} 笔，跳过已有该资产 {} 笔",
-        deposit_asset, n_dep, skipped
+        "子账户: 已有 {} / 需新建 {}",
+        accounts.len() - need_init.len(),
+        need_init.len()
     );
 
-    let mut done = 0u32;
-    if let Some(multicall) = multicall_addr {
-        let subs: Vec<H160> = need_deposit
-            .iter()
-            .map(|&i| accounts[i].subaccount)
-            .collect();
-        let total_batches = subs.len().div_ceil(deposit_batch_size);
-        let mut evm_nonce = unix_ms();
-        let mut batch_no = 0u32;
-        for chunk in chunk_subaccounts(&subs, deposit_batch_size) {
-            batch_no += 1;
-            if batch_no == 1 || batch_no == total_batches as u32 || batch_no % 10 == 0 {
-                info!(
-                    "multicall deposit 批 {}/{}（本批 {} 户，累计约 {} 户）",
-                    batch_no,
-                    total_batches,
-                    chunk.len(),
-                    done.saturating_add(chunk.len() as u32)
-                );
-            }
-            deposit_batch_via_multicall(
-                &root_kp,
-                multicall,
-                chunk,
-                &deposit_asset,
-                deposit_amount,
-                evm_nonce,
-            )
-            .await?;
-            done = done.saturating_add(chunk.len() as u32);
-            evm_nonce = evm_nonce.saturating_add(1).max(unix_ms());
-            tokio::time::sleep(Duration::from_millis(80)).await;
-        }
-        info!(
-            "multicall deposit 完成: {} 笔子账户存款，{} 笔 EVM 交易（batch_size={}）",
-            done, batch_no, deposit_batch_size
-        );
+    // 2. quota + initialize
+    quota_and_initialize(&mut accounts, &need_init, &root_kp, &mut root_nonce).await?;
+
+    // 3. 存款
+    let need_dep = indices_needing_deposit(&accounts, asset.as_bytes()).await?;
+    info!(
+        "deposit {asset:?}: 待充 {} / 已有 {}",
+        need_dep.len(),
+        accounts.len() - need_dep.len()
+    );
+
+    let done = if let Some(mc) = multicall {
+        run_multicall_deposits(
+            &root_kp,
+            mc,
+            &accounts,
+            &need_dep,
+            &asset,
+            amount,
+            mc_batch,
+            &mut root_nonce,
+        )
+        .await?
     } else {
-        info!(
-            "逐笔 Substrate deposit（ROOTER 单 nonce，整体耗时主要取决于 RPC/池子）…"
-        );
-        for (di, &i) in need_deposit.iter().enumerate() {
-            let x = &accounts[i];
-            if di == 0 || (di + 1) % 50 == 0 || di + 1 == n_dep {
-                info!(
-                    "deposit submit 进度 {}/{}（当前 {}）",
-                    di + 1,
-                    n_dep,
-                    x.name
-                );
-            }
-            debug!("ROOTER deposit -> {:?} ({})", x.subaccount, x.name);
-            deposit(
+        for &i in &need_dep {
+            deposit_substrate(
                 &root_kp,
-                &x.subaccount,
-                LENDING_MARKET_ID,
-                &deposit_asset,
-                deposit_amount,
+                accounts[i].subaccount,
+                &asset,
+                amount,
                 &mut root_nonce,
             )
             .await?;
-            done += 1;
         }
-    }
+        need_dep.len() as u32
+    };
 
+    let skipped = (accounts.len() - need_dep.len()) as u32;
     info!(
-        "rooter_deposit 完成: 新发起存款约 {} 笔，跳过已充 {} 笔，共 {} 个账户",
-        done,
-        skipped,
+        "完成: 新充 {done} 笔, 跳过 {skipped} 笔, 共 {} 户",
         accounts.len()
     );
     Ok(())

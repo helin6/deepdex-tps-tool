@@ -7,7 +7,9 @@ interface ILending {
 }
 
 /// @title RootDepositMulticall
-/// @notice 由资金账户（部署者）在一笔 EVM 交易内对多个子账户批量 `deposit`，降低 ROOTER 逐笔 Substrate deposit 的 nonce/RPC 开销。
+/// @notice 由 owner（部署者 ROOTER）调用；内部 `L.deposit` 的链上 origin 为本合约地址。
+/// @dev 须事先：① ROOTER 为 owner ② 向本合约转入足够 USDC（非 ROOTER 钱包）③ `rooter_deposit` 会为合约地址激活 quota。
+///      单笔 batch 过大可能 EVM OOG，请用较小 `DEPOSIT_MULTICALL_BATCH_SIZE`（如 25）。
 contract RootDepositMulticall {
     address public immutable lending;
     address public immutable owner;

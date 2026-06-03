@@ -4969,6 +4969,7 @@ dependencies = [
  "primitive-types 0.12.2",
  "rlp",
  "secp256k1 0.30.0",
+ "serde_json",
  "sha3",
  "subxt",
  "subxt-signer",

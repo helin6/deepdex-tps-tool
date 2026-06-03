@@ -6,8 +6,8 @@ import {RootDepositMulticall} from "../src/RootDepositMulticall.sol";
 
 /// @notice 部署 RootDepositMulticall，owner = 部署者（请使用 ROOTER 私钥）。
 /// 用法（在 `deepdex-tps-tool/contracts` 目录）:
-///   export WS_URL=
-///   export ROOTER_PRIVATE_KEY=
+///   export WS_URL=ws://192.168.201.11:9928  
+///   export ROOTER_PRIVATE_KEY=0x349f7f21d09265b525c562df697cee56d65fe23fe638bb890dd2213a0cca5dcd
 ///   forge script script/DeployRootDepositMulticall.s.sol:DeployRootDepositMulticall \
 ///     --rpc-url $WS_URL --broadcast --legacy --with-gas-price 0 -vvv
 contract DeployRootDepositMulticall is Script {
