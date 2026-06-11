@@ -228,7 +228,14 @@ async fn resolve_accounts_parallel(
         .collect()
 }
 
-async fn load_mark_price(market_id: u16) -> anyhow::Result<u128> {
+struct MarketQuoteCtx {
+    mark_price: u128,
+    tick_size: u128,
+    lower: u128,
+    upper: u128,
+}
+
+async fn load_market_quote_ctx(market_id: u16) -> anyhow::Result<MarketQuoteCtx> {
     let api = get_api().await?;
     let q = node_runtime::storage().perp_market().perp_markets(market_id);
     let m = api
@@ -238,27 +245,50 @@ async fn load_mark_price(market_id: u16) -> anyhow::Result<u128> {
         .fetch(&q)
         .await?
         .ok_or_else(|| anyhow::anyhow!("market {market_id} 不存在"))?;
-    Ok(m.mark_price)
+    let mark_price = m.mark_price as u128;
+    let tick_size = m.order_spec.tick_size as u128;
+    anyhow::ensure!(tick_size > 0, "market {market_id} tick_size 为 0");
+    let dev = m.max_deviation_bps as u128;
+    let lower = mark_price.saturating_mul(10_000u128.saturating_sub(dev)) / 10_000;
+    let upper = mark_price.saturating_mul(10_000u128.saturating_add(dev)) / 10_000;
+    Ok(MarketQuoteCtx {
+        mark_price,
+        tick_size,
+        lower,
+        upper,
+    })
 }
 
-fn prune_mark(p: u128) -> u128 {
-    let r = p.checked_rem_euclid(100_000).unwrap_or(0);
-    p.saturating_sub(r)
+fn prune_price_to_tick(price: u128, tick: u128) -> u128 {
+    if tick == 0 {
+        return price;
+    }
+    price.saturating_sub(price % tick)
+}
+
+fn limit_price_for_account(ctx: &MarketQuoteCtx, account_index: usize, is_long: bool) -> u128 {
+    let n = (account_index as u128).saturating_add(1);
+    let anchor = prune_price_to_tick(ctx.mark_price, ctx.tick_size);
+    let off = ctx.tick_size.saturating_mul(n);
+    let raw = if is_long {
+        anchor.saturating_sub(off)
+    } else {
+        anchor.saturating_add(off)
+    };
+    let clamped = raw.clamp(ctx.lower, ctx.upper);
+    prune_price_to_tick(clamped, ctx.tick_size)
 }
 
 async fn assign_quotes(mut accounts: Vec<Account>, market_id: u16) -> anyhow::Result<Vec<Account>> {
-    let tick: u128 = 10_000;
-    let mark = load_mark_price(market_id).await?;
-    let mark = prune_mark(mark);
+    let ctx = load_market_quote_ctx(market_id).await?;
     for (i, a) in accounts.iter_mut().enumerate() {
         a.is_long = i % 2 == 0;
-        let off = tick.saturating_mul((i as u128).saturating_add(1));
-        a.limit_price = if a.is_long {
-            mark.saturating_sub(off)
-        } else {
-            mark.saturating_add(off)
-        };
+        a.limit_price = limit_price_for_account(&ctx, i, a.is_long);
     }
+    info!(
+        "限价分配 market={}: mark={} tick={} band=[{}, {}]",
+        market_id, ctx.mark_price, ctx.tick_size, ctx.lower, ctx.upper
+    );
     Ok(accounts)
 }
 

@@ -53,4 +53,4 @@ path = "src/bin/perp_bench_fence.rs"
 [[bin]]
 name = "testnet_test"
 path = "src/bin/testnet_test.rs"
-# 默认编 Substrate 压测路径；EVM calldata 需 --features precompile-utils（当前 SDK 链可能编不过）
+required-features = ["precompile-utils"]

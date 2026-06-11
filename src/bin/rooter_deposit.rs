@@ -150,17 +150,30 @@ async fn system_account_quota(aid: &AccountId20) -> anyhow::Result<u32> {
     Ok(info.map(|a| a.quota).unwrap_or(0))
 }
 
-async fn has_lending_deposit(sub: H160, asset: &[u8]) -> anyhow::Result<bool> {
+async fn lending_deposit_amount(sub: H160, asset: &[u8]) -> anyhow::Result<u128> {
     let q = node_runtime::storage().lending().positions_for(
         AccountId20 { 0: sub.0 },
         LENDING_MARKET_ID,
     );
     let positions = get_api().await?.storage().at_latest().await?.fetch(&q).await?;
-    Ok(positions.is_some_and(|p| {
-        p.deposits
-            .iter()
-            .any(|(k, amt)| k.0 == LENDING_MARKET_ID && k.1.0.as_slice() == asset && *amt > 0)
-    }))
+    Ok(positions
+        .map(|p| {
+            p.deposits
+                .iter()
+                .filter(|(k, _)| k.0 == LENDING_MARKET_ID && k.1.0.as_slice() == asset)
+                .map(|(_, amt)| *amt)
+                .sum()
+        })
+        .unwrap_or(0))
+}
+
+/// 存款是否已达到跳过阈值（`>= min_amount` 则视为已有足够余额、不再补存）。
+async fn has_sufficient_lending_deposit(
+    sub: H160,
+    asset: &[u8],
+    min_amount: u128,
+) -> anyhow::Result<bool> {
+    Ok(lending_deposit_amount(sub, asset).await? >= min_amount)
 }
 
 // ── ROOTER 提交（quota 等）────────────────────────────────────────────
@@ -410,7 +423,7 @@ async fn wait_batch_deposits(subs: &[H160], asset: &[u8]) -> anyhow::Result<Vec<
         let missing: Vec<_> = {
             let mut m = Vec::new();
             for &s in subs {
-                if !has_lending_deposit(s, asset).await? {
+                if lending_deposit_amount(s, asset).await? == 0 {
                     m.push(s);
                 }
             }
@@ -595,7 +608,11 @@ async fn quota_and_initialize(
     Ok(())
 }
 
-async fn indices_needing_deposit(accounts: &[AccountDetail], asset: &[u8]) -> anyhow::Result<Vec<usize>> {
+async fn indices_needing_deposit(
+    accounts: &[AccountDetail],
+    asset: &[u8],
+    min_amount: u128,
+) -> anyhow::Result<Vec<usize>> {
     let n = accounts.len();
     let mut need = Vec::new();
     for start in (0..n).step_by(PARALLEL_CHAIN_SCAN) {
@@ -605,7 +622,8 @@ async fn indices_needing_deposit(accounts: &[AccountDetail], asset: &[u8]) -> an
             let acc = accounts[i].clone();
             let asset = asset.to_vec();
             set.spawn(async move {
-                let skip = has_lending_deposit(acc.subaccount, &asset).await?;
+                let skip =
+                    has_sufficient_lending_deposit(acc.subaccount, &asset, min_amount).await?;
                 Ok::<_, anyhow::Error>((i, skip))
             });
         }
@@ -671,9 +689,9 @@ async fn main() -> anyhow::Result<()> {
     quota_and_initialize(&mut accounts, &need_init, &root_kp, &mut root_nonce).await?;
 
     // 3. 存款
-    let need_dep = indices_needing_deposit(&accounts, asset.as_bytes()).await?;
+    let need_dep = indices_needing_deposit(&accounts, asset.as_bytes(), amount).await?;
     info!(
-        "deposit {asset:?}: 待充 {} / 已有 {}",
+        "deposit {asset:?}: 待充 {} / 已有 {}（跳过阈值 >= {amount}，即已有至少该数量则不再充）",
         need_dep.len(),
         accounts.len() - need_dep.len()
     );

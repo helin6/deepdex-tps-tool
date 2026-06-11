@@ -1,0 +1,4 @@
+# 服务器上 git 常把 https://github.com 重写成 git@github.com，libgit2 无 SSH 密钥会失败。
+# 强制 Cargo 走 git CLI（与 `git ls-remote https://...` 行为一致）。
+[net]
+git-fetch-with-cli = true
