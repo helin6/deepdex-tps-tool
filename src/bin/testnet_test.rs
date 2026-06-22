@@ -29,7 +29,7 @@ use tokio::{self};
 use sha3::Digest;
 use tokio::sync::{OnceCell, RwLock};
 
-// subxt metadata --url http://127.0.0.1:9933 --version 14 -f bytes > deepx-node-metadata.scale
+// subxt metadata --url http://192.168.201.12:9923 --version 14 -f bytes > deepx-node-metadata.scale
 #[subxt::subxt(
     runtime_metadata_path = "./deepx-node-metadata.scale",
     derive_for_all_types = "Eq, PartialEq, Clone, Debug"
@@ -56,7 +56,9 @@ const PERP_CANCEL_ORDER_SELECTOR: [u8; 4] = [247, 106, 0, 107];
 const PERP_ADDRESS: [u8; 20] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 78];
 
 //const NODE_WS_ADDR: &str = "wss://rpc-testnet.deepx.fi";
-const NODE_WS_ADDR: &str = "ws://136.110.109.17:9937";
+// const NODE_WS_ADDR: &str = "ws://192.168.201.11:9923";
+const NODE_WS_ADDR: &str = "ws://192.168.201.11:9923";
+
 static GLOBAL_API: OnceCell<OnlineClient<EthRuntimeConfig>> = OnceCell::const_new();
 static GLOBAL_RPC: OnceCell<RpcClient> = OnceCell::const_new();
 
@@ -78,10 +80,10 @@ const MAX_ACTIVE_ORDERS: u32 = 500000;
 
 const SIZE_OF_EACH_ORDER: u128 = 10_000;
 
-const MATCHED_PERCENT: u32 = 0; // 1%
+const MATCHED_PERCENT: u32 = 1; // 1%
 
 const BATCH_OPS_NUM: u32 = 1;
-const TEST_ACCOUNT_NUM: u32 = 20;
+const TEST_ACCOUNT_NUM: u32 = 200;
 const TEST_MARKET_ID: u16 = 3;
 const PENDING_NUM: u32 = 0;
 const MARKET_NUM: u32 = 1;
@@ -108,8 +110,8 @@ async fn main() -> anyhow::Result<()> {
     //     let x = x.clone();
     //     let _ = get_first_subaccount_ensure_exist(&x.kp, x.name.as_str()).await;
     // }
-    //
-    // tokio::time::sleep(Duration::from_millis(10000)).await;
+
+    tokio::time::sleep(Duration::from_millis(5000)).await;
 
     for x in test_accounts.iter_mut() {
         if let Ok(subaccounts) = get_subaccount(&x.kp).await {
@@ -136,17 +138,17 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::time::sleep(Duration::from_millis(10000)).await;
 
-    for x in &test_accounts {
-        loop {
-            if let Err(e) = check_exist_pos(x).await {
-                warn!("waiting for closing: {:?}, subaccount: {:?}", e, x.subaccount);
-                tokio::time::sleep(Duration::from_millis(1000)).await;
-            } else {
-                break;
-            }
-        }
-    }
-    info!("close all positions");
+    // for x in &test_accounts {
+    //     loop {
+    //         if let Err(e) = check_exist_pos(x).await {
+    //             warn!("waiting for closing: {:?}, subaccount: {:?}", e, x.subaccount);
+    //             tokio::time::sleep(Duration::from_millis(1000)).await;
+    //         } else {
+    //             break;
+    //         }
+    //     }
+    // }
+    // info!("close all positions");
 
     for x in &test_accounts {
         cancel_pre_orders(x).await.unwrap();
@@ -173,11 +175,12 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
         info!(
-            "do deposit by ROOTER: {:?} to subaccount: {:?}",
+            "do deposit by ROOTER: {:?} with nonce: {nonce} to subaccount: {:?}",
             hex::encode(&root_kp.public_key().to_account_id().0),
             subaccount
         );
         deposit(&root_kp, &subaccount, 1, "usdc", amount, &mut nonce).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     tokio::time::sleep(Duration::from_millis(5000)).await;
@@ -245,9 +248,9 @@ async fn main() -> anyhow::Result<()> {
                             now = std::time::Instant::now();
                             match rpc.author_submit_extrinsics(&extrinsics).await {
                                 Ok(batch_res) => {
-                                    for res in batch_res {
+                                    for (index, res) in batch_res.into_iter().enumerate() {
                                         if let Err(e) = res {
-                                            warn!("Error submitting inner extrinsics for {user_name}: {:?}, try again", e);
+                                            warn!("Error submitting inner extrinsics for {user_name}, index: {index}, res: {:?}, try again", e);
                                             // tokio::time::sleep(Duration::from_millis(600)).await;
                                             // continue;
                                         }
@@ -317,7 +320,7 @@ async fn main() -> anyhow::Result<()> {
     }
     join_all(tasks).await;
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // 最后查询一下所有的仓位和挂单
     let api = get_api().await?;
@@ -694,7 +697,19 @@ async fn place_order_no_wait_response_evm(
         nonce += 1;
     }
     info!("{user_name} subaccount: {subaccount:?} build tx finished");
-
+    {
+        *READY_ACCOUNT_NUM.write().await += 1;
+    }
+    // waiting for all accounts finish building task
+    let expect_accounts_num = *EXPECT_ACCOUNT_NUM.read().await;
+    loop {
+        if *READY_ACCOUNT_NUM.read().await == expect_accounts_num {
+            info!("{user_name} subaccount: {subaccount:?} try to send tx");
+            break;
+        } else {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+    }
     let mut tx_iter = encoded_inner.chunks(chunk_size as usize);
     loop {
         if let Some(encoded_inner) = tx_iter.next() {
@@ -812,9 +827,14 @@ async fn place_order_no_wait_response_old_batch(
         }
     }
     let mut tx_iter = encoded_inner.chunks(chunk_size as usize);
+    let mut now = std::time::Instant::now();
     loop {
         if let Some(encoded_inner) = tx_iter.next() {
+            if now.elapsed() < Duration::from_secs(1) {
+                tokio::time::sleep(Duration::from_secs(1) - now.elapsed()).await;
+            }
             pool_sender.send((encoded_inner.to_vec(), user_name.to_string()))?;
+            now = std::time::Instant::now();
         } else {
             info!("{user_name} subaccount: {subaccount:?} send tx finished");
             break;
@@ -1332,12 +1352,13 @@ async fn deposit(kp: &Keypair, subaccount: &H160, market_id: u8, asset: &str, am
                 asset,
                 amount
             );
-            *nonce += 2;
         }
         Err(e) => {
             warn!("Failed to deposit for subaccount {:?}: {:?}", subaccount, e);
         }
     }
+    *nonce += 2;
+
     Ok(())
 }
 
