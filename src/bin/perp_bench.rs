@@ -1,6 +1,7 @@
 //! # 永续压测（`perp_bench`）
 //!
-//! 阶段：**配置 → 派生账户 → 并发解析子账户 →（可选）准备 →（可选）墙钟对齐 → 按账户并发发压**。
+//! 阶段：**配置 → 派生账户 → 并发解析子账户 →（可选）准备 →（可选）墙钟对齐 → 并行预编签 → 每 `1/RATE` 秒一批 `author_submit_extrinsics`（全账户各 1 笔）**。
+//! 与 `perp_bench_fence` 相同预先构造 `RATE×BENCH_DURATION_SEC` 笔 place/cancel 交替 payload；发压阶段每 `1/RATE` 秒调用一次批量 RPC，每批 `ACCOUNT_COUNT` 笔（每账户取同一 tick 序号的一笔）。
 //! 多机：各机配置不同 `FIRST_ADDR_INDEX` / `ACCOUNT_COUNT`，并共用同一`BENCH_START_AT_UNIX_MS` 即可近似同时起跑。
 //!
 //! ```bash
@@ -19,18 +20,21 @@
 //! | `BENCH_MARKET_ID` | 永续 `market_id` | `3` |
 //! | `BENCH_ORDER_SIZE` | `place_order` size | `1000000000000000` |
 //! | `BENCH_MATCHED_PERCENT` | 与 `testnet_test` 中 `MATCHED_PERCENT` 同义 | `0` |
+//! | `FENCE_POST_CHAIN_SCAN_SEC` | 发送结束后等待多少秒再扫链核对；`0` 跳过（与 `perp_bench_fence` 同键） | `5` |
 
 #![allow(missing_docs)]
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use subxt::backend::rpc::RpcClient;
 use subxt::config::substrate::SubstrateExtrinsicParamsBuilder;
 use subxt::config::{substrate, SubstrateExtrinsicParams, Config};
+use subxt::ext::codec::{Compact, Encode};
 use subxt::ext::subxt_core::utils::AccountId20;
 use subxt::ext::subxt_rpcs::LegacyRpcMethods;
 use subxt::utils::H160;
@@ -101,6 +105,8 @@ struct BenchExtra {
     market_id: u16,
     order_size: u128,
     matched_percent: u32,
+    /// 发送结束后 sleep 再扫链；`0` 不做链上汇总。
+    post_chain_scan_sec: u64,
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
@@ -140,6 +146,7 @@ impl BenchExtra {
             market_id: env_u64("BENCH_MARKET_ID", 3).min(u16::MAX as u64) as u16,
             order_size: env_u64("BENCH_ORDER_SIZE", 1_000_000_000_000_000) as u128,
             matched_percent,
+            post_chain_scan_sec: env_u64("FENCE_POST_CHAIN_SCAN_SEC", 5).min(600),
         })
     }
 }
@@ -158,6 +165,365 @@ struct Account {
 
 static GLOBAL_SUBMIT_OK: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_SUBMIT_ERR: AtomicU64 = AtomicU64::new(0);
+/// 预编后未发出（超过 `BENCH_DURATION_SEC` 截止或 RPC 初始化失败等）。
+static GLOBAL_SUBMIT_SKIP: AtomicU64 = AtomicU64::new(0);
+
+/// 汇总 submit 失败信息（限流打印，避免刷屏）。
+static SUBMIT_ERR_AGG: OnceLock<Mutex<SubmitErrAgg>> = OnceLock::new();
+
+#[derive(Default)]
+struct SubmitErrAgg {
+    sample_lines: usize,
+    by_msg: HashMap<String, u64>,
+    pool_limit_hits: u64,
+    batch_len_mismatch: u64,
+}
+
+fn submit_err_text(err: &impl std::fmt::Debug) -> String {
+    format!("{err:?}")
+}
+
+fn is_pool_limit_msg(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("immediatelydropped")
+        || lower.contains("couldn't enter the pool because of the limit")
+        || lower.contains("pool locked")
+        || (lower.contains("pool") && lower.contains("limit"))
+}
+
+impl SubmitErrAgg {
+    const MAX_SAMPLES: usize = 32;
+    const MAX_MSG_LEN: usize = 320;
+
+    fn reset() {
+        if let Some(m) = SUBMIT_ERR_AGG.get() {
+            *m.lock().expect("submit err agg lock") = SubmitErrAgg::default();
+        }
+    }
+
+    fn truncate_key(raw: &str) -> String {
+        if raw.len() > Self::MAX_MSG_LEN {
+            format!("{}…", &raw[..Self::MAX_MSG_LEN])
+        } else {
+            raw.to_string()
+        }
+    }
+
+    fn record(&mut self, ctx: &str, err: &impl std::fmt::Debug) {
+        let key = Self::truncate_key(&submit_err_text(err));
+        let pool_hit = is_pool_limit_msg(&key);
+        if pool_hit {
+            self.pool_limit_hits += 1;
+        }
+        *self.by_msg.entry(key.clone()).or_default() += 1;
+        if pool_hit {
+            warn!("发压 submit 失败 [pool limit 相关] [{ctx}]: {key}");
+        } else if self.sample_lines < Self::MAX_SAMPLES {
+            warn!("发压 submit 失败 [{ctx}]: {key}");
+            self.sample_lines += 1;
+        }
+    }
+
+    fn record_batch_len_mismatch(&mut self, expected: u32, got: usize) {
+        self.batch_len_mismatch += 1;
+        warn!(
+            "author_submit_extrinsics 返回条数与提交笔数不一致: 提交={expected} 返回={got}（未计入的笔既非 ok 也非 err，请核对节点 RPC）"
+        );
+    }
+
+    fn log_summary(&self, rpc_ok: u64, rpc_err: u64) {
+        if self.batch_len_mismatch > 0 {
+            warn!(
+                "发压期间 author_submit_extrinsics 返回条数不一致共 {} 次",
+                self.batch_len_mismatch
+            );
+        }
+        if self.pool_limit_hits > 0 {
+            warn!(
+                "检测到 pool limit 相关 RPC 拒绝共 {} 次（关键词 ImmediatelyDropped / pool+limit）；开发问的「有没有报 pool limit」→ **有**",
+                self.pool_limit_hits
+            );
+        } else if rpc_err == 0 && rpc_ok > 0 {
+            info!(
+                "未检测到 pool limit 相关 RPC 错误（ImmediatelyDropped 等）；开发问的「有没有报 pool limit」→ **本次 run 的 submit 路径上没有**"
+            );
+        }
+        if self.by_msg.is_empty() {
+            if rpc_err == 0 && rpc_ok > 0 {
+                info!(
+                    "发压 RPC 批内无 Err 返回（submit_err=0）。说明：Ok 仅表示节点接受交易进池，不等于链上 place 执行成功；若订单号增量偏低请看「异常账户诊断」"
+                );
+            }
+            return;
+        }
+        let mut rows: Vec<_> = self.by_msg.iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(a.1));
+        warn!(
+            "发压 submit 错误汇总（RPC submit_err={}，下列为去重后的错误类型，pool limit 类见上方；至多 {} 条非 pool 样本见 warn）:",
+            rpc_err,
+            self.sample_lines
+        );
+        for (msg, cnt) in rows.iter().take(16) {
+            let tag = if is_pool_limit_msg(msg) {
+                "[pool limit] "
+            } else {
+                ""
+            };
+            warn!("  ×{cnt} {tag}{msg}");
+        }
+        if rows.len() > 16 {
+            warn!("  … 另有 {} 种错误未列出", rows.len() - 16);
+        }
+    }
+}
+
+fn record_submit_err(ctx: &str, err: &impl std::fmt::Debug) {
+    let Some(m) = SUBMIT_ERR_AGG.get() else {
+        warn!("发压 submit 失败 [{ctx}]: {}", submit_err_text(err));
+        return;
+    };
+    m.lock().expect("submit err agg lock").record(ctx, err);
+}
+
+fn log_submit_err_summary(rpc_ok: u64, rpc_err: u64) {
+    if let Some(m) = SUBMIT_ERR_AGG.get() {
+        m.lock().expect("submit err agg lock").log_summary(rpc_ok, rpc_err);
+    }
+}
+
+/// 与 `perp_bench_fence` / `testnet_test` 收尾一致：`next_order_id - 1` 为累计订单号末端。
+#[derive(Clone, Copy, Default, Debug)]
+struct ChainLineStat {
+    cumulative_order_excl: u32,
+    pending_on_market: u32,
+    matched_lots: u128,
+}
+
+async fn chain_stats_one(
+    subaccount: H160,
+    market_id: u16,
+    order_size: u128,
+) -> anyhow::Result<ChainLineStat> {
+    let api = get_api().await?;
+    let info_q = node_runtime::storage()
+        .subaccount()
+        .subaccount_info(subaccount.clone());
+    let info = api.storage().at_latest().await?.fetch(&info_q).await?;
+    let cumulative_order_excl = info
+        .as_ref()
+        .map(|i| i.next_order_id.saturating_sub(1))
+        .unwrap_or(0);
+
+    let pos_q = node_runtime::storage()
+        .perp_market()
+        .user_perp_positions(subaccount.clone());
+    let positions = api
+        .storage()
+        .at_latest()
+        .await?
+        .fetch(&pos_q)
+        .await?
+        .unwrap_or_default();
+    let sz = order_size.max(1);
+    let matched_lots = positions
+        .iter()
+        .find(|p| p.market_id == market_id)
+        .map(|p| p.base_asset_amount / sz)
+        .unwrap_or(0);
+
+    let ord_q = node_runtime::storage()
+        .perp_market()
+        .active_perp_orders_for(subaccount);
+    let ord_wrap = api.storage().at_latest().await?.fetch(&ord_q).await?;
+    let pending_on_market = ord_wrap
+        .as_ref()
+        .map(|orders| {
+            orders
+                .iter()
+                .filter(|(mid, _)| *mid == market_id)
+                .map(|(_, v)| v.len())
+                .sum::<usize>() as u32
+        })
+        .unwrap_or(0);
+
+    Ok(ChainLineStat {
+        cumulative_order_excl,
+        pending_on_market,
+        matched_lots,
+    })
+}
+
+async fn fetch_chain_stats_parallel(
+    keys: &[(String, H160)],
+    market_id: u16,
+    order_size: u128,
+    concurrency: usize,
+) -> anyhow::Result<Vec<ChainLineStat>> {
+    let n = keys.len();
+    let mut out: Vec<Option<ChainLineStat>> = vec![None; n];
+    for chunk_start in (0..n).step_by(concurrency) {
+        let end = (chunk_start + concurrency).min(n);
+        let mut set = JoinSet::new();
+        for i in chunk_start..end {
+            let sub = keys[i].1;
+            set.spawn(async move {
+                let st = chain_stats_one(sub, market_id, order_size).await?;
+                Ok::<_, anyhow::Error>((i, st))
+            });
+        }
+        while let Some(j) = set.join_next().await {
+            let (idx, st) = j??;
+            out[idx] = Some(st);
+        }
+    }
+    out.into_iter()
+        .map(|x| x.ok_or_else(|| anyhow::anyhow!("chain stat join internal")))
+        .collect()
+}
+
+fn log_chain_reconcile(
+    keys: &[(String, H160)],
+    pre: &[ChainLineStat],
+    post: &[ChainLineStat],
+    places_per_account: u32,
+    market_id: u16,
+    sleep_sec: u64,
+    rpc_ok: u64,
+    rpc_err: u64,
+) {
+    let n_acc = keys.len();
+    if n_acc == 0 || pre.len() != n_acc || post.len() != n_acc {
+        warn!("链上核对: 内部长度不一致，跳过汇总");
+        return;
+    }
+
+    let expect_order_delta: u64 = (places_per_account as u64).saturating_mul(n_acc as u64);
+    let mut sum_delta_ord: u64 = 0;
+    let mut sum_pre_pend: u64 = 0;
+    let mut sum_post_pend: u64 = 0;
+    let mut sum_pre_matched: u128 = 0;
+    let mut sum_post_matched: u128 = 0;
+    let mut weak_accounts: Vec<(String, u32)> = Vec::new();
+
+    for i in 0..n_acc {
+        let d = post[i]
+            .cumulative_order_excl
+            .saturating_sub(pre[i].cumulative_order_excl);
+        sum_delta_ord = sum_delta_ord.saturating_add(d as u64);
+        sum_pre_pend = sum_pre_pend.saturating_add(pre[i].pending_on_market as u64);
+        sum_post_pend = sum_post_pend.saturating_add(post[i].pending_on_market as u64);
+        sum_pre_matched = sum_pre_matched.saturating_add(pre[i].matched_lots);
+        sum_post_matched = sum_post_matched.saturating_add(post[i].matched_lots);
+        if d < places_per_account {
+            weak_accounts.push((keys[i].0.clone(), d));
+        }
+    }
+
+    let dm = sum_post_matched.saturating_sub(sum_pre_matched);
+    info!(
+        "链上核对(发送结束后已等待 {}s): 全户累计订单号末端(next_order_id−1) 增量合计={}；若每笔 place 均上链则理论约 {} (= {} 户 × 每账户 place 笔数 {})",
+        sleep_sec, sum_delta_ord, expect_order_delta, n_acc, places_per_account
+    );
+    info!(
+        "链上 market={}: 挂单数合计 pre={} → post={}；matched_lots 全户合计 pre={} post={}（Δ={}，撮合/仓位变化可参考）",
+        market_id, sum_pre_pend, sum_post_pend, sum_pre_matched, sum_post_matched, dm
+    );
+    info!(
+        "RPC 批量返回（含 place+cancel 逐条）: submit_ok={} submit_err={} — 与上列「订单号增量」口径不同，不能直接等同「上链 place 笔数」",
+        rpc_ok, rpc_err
+    );
+
+    let threshold = expect_order_delta.saturating_mul(9) / 10;
+    if expect_order_delta > 0 && sum_delta_ord < threshold {
+        warn!(
+            "链上订单号增量 {} 低于理论 place 上链量 {} 的约 90%（{}），可能存在丢交易、未打包或 RPC 成功但执行失败等情况",
+            sum_delta_ord, expect_order_delta, threshold
+        );
+    }
+
+    const CAP: usize = 8;
+    if !weak_accounts.is_empty() {
+        weak_accounts.sort_by(|a, b| a.1.cmp(&b.1));
+        let show = weak_accounts.len().min(CAP);
+        warn!(
+            "订单号增量低于每账户 place 数({}) 的账户（至多列 {} 个，按增量升序）: {:?}",
+            places_per_account,
+            show,
+            &weak_accounts[..show]
+        );
+        if weak_accounts.len() > CAP {
+            warn!("… 另有 {} 个账户未列出", weak_accounts.len() - CAP);
+        }
+    }
+}
+
+async fn diagnose_weak_accounts(
+    keys: &[(String, H160)],
+    pre: &[ChainLineStat],
+    post: &[ChainLineStat],
+    places_per_account: u32,
+) -> anyhow::Result<()> {
+    let n_acc = keys.len();
+    if n_acc == 0 || pre.len() != n_acc || post.len() != n_acc {
+        return Ok(());
+    }
+    let mut weak: Vec<usize> = (0..n_acc)
+        .filter(|&i| {
+            post[i]
+                .cumulative_order_excl
+                .saturating_sub(pre[i].cumulative_order_excl)
+                < places_per_account
+        })
+        .collect();
+    if weak.is_empty() {
+        return Ok(());
+    }
+    weak.sort_by_key(|&i| {
+        post[i]
+            .cumulative_order_excl
+            .saturating_sub(pre[i].cumulative_order_excl)
+    });
+
+    const CAP: usize = 12;
+    warn!(
+        "异常账户诊断（订单号增量 < 每账户 place 数 {}）：共 {} 户，展开前 {} 户",
+        places_per_account,
+        weak.len(),
+        weak.len().min(CAP)
+    );
+
+    let api = get_api().await?;
+    for &i in weak.iter().take(CAP) {
+        let (name, sub) = &keys[i];
+        let delta = post[i]
+            .cumulative_order_excl
+            .saturating_sub(pre[i].cumulative_order_excl);
+        let info_q = node_runtime::storage().subaccount().subaccount_info(sub.clone());
+        let info = api.storage().at_latest().await?.fetch(&info_q).await?;
+        let info_hint = match &info {
+            Some(inf) => format!("存在 next_order_id={}", inf.next_order_id),
+            None => "缺失（子账户未初始化？）".to_string(),
+        };
+        warn!(
+            "  {name} sub={sub:?} Δorder_id={delta} cumulative {c0}→{c1} pending {p0}→{p1} matched_lots {m0}→{m1} | {info_hint}",
+            c0 = pre[i].cumulative_order_excl,
+            c1 = post[i].cumulative_order_excl,
+            p0 = pre[i].pending_on_market,
+            p1 = post[i].pending_on_market,
+            m0 = pre[i].matched_lots,
+            m1 = post[i].matched_lots,
+        );
+        if delta == 0 {
+            warn!(
+                "    → 该户链上无新订单号：若上方 submit_err=0，多为交易进池但未成功执行（nonce/签名/配额/Invalid signing address 等），RPC Ok 通常不回传执行错误"
+            );
+        }
+    }
+    if weak.len() > CAP {
+        warn!("  … 另有 {} 户未展开", weak.len() - CAP);
+    }
+    Ok(())
+}
 
 fn derive_accounts(first: u32, count: u32) -> anyhow::Result<Vec<(String, Keypair)>> {
     let mut v = Vec::with_capacity(count as usize);
@@ -428,55 +794,32 @@ async fn sleep_until_unix_ms(deadline_ms: u64) {
     }
 }
 
-// ─── load：place / cancel 交错；nonce 用 Unix 毫秒底 + 递增（见文件头）──
+// ─── 预编签 + 按 1/RATE 逐笔 submit（nonce 用 Unix 毫秒底 + 递增）──
 
-async fn account_stream_place_cancel(
+/// 离线编签 `n` 笔 place/cancel 交替（与 `perp_bench_fence` 一致，仅去掉 RPC）。
+async fn build_account_extrinsics(
     acc: Account,
     market_id: u16,
     order_size: u128,
-    rate: u32,
     matched_percent: u32,
-    deadline: Instant,
-) {
-    let spacing = Duration::from_secs_f64(1.0 / rate.max(1) as f64);
-    let mut tick = tokio::time::interval(spacing);
-    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-    let api = match get_api().await {
-        Ok(a) => a,
-        Err(e) => {
-            warn!("{} get_api: {e:?}", acc.name);
-            return;
-        }
-    };
-    let rpc = match get_rpc().await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("{} get_rpc: {e:?}", acc.name);
-            return;
-        }
-    };
-
-    // 与 `main.rs::place_order_no_wait_response_evm` 一致：时间戳 nonce，不用 account_nonce。
+    n: u32,
+) -> anyhow::Result<Vec<Bytes>> {
+    let api = get_api().await?;
     let mut hf_nonce = unix_ms();
-
     let mut cancel_id = acc.next_order_id;
-    let mut i: u64 = 1;
     let mut skip_cancel = false;
     let match_price = acc.limit_price;
+    let mut out = Vec::with_capacity(n as usize);
 
-    while Instant::now() < deadline {
-        tick.tick().await;
-
+    for i in 1u32..=n {
         let is_place = i % 2 == 1;
         if is_place {
             cancel_id = cancel_id.saturating_add(1);
         }
-
         let tx_nonce = hf_nonce;
         hf_nonce = hf_nonce.saturating_add(1).max(unix_ms());
 
-        let tx_bytes: Bytes = match if is_place {
+        let tx_bytes: Bytes = if is_place {
             let price = target_price(
                 matched_percent,
                 acc.is_long,
@@ -500,9 +843,11 @@ async fn account_stream_place_cancel(
                 PostOnlyParam::None,
             );
             let params = SubstrateExtrinsicParamsBuilder::new().nonce(tx_nonce).build();
-            api.tx()
-                .create_partial_offline(&call, params)
-                .map(|mut p| Bytes::from_owner(p.sign(&acc.kp).into_encoded()))
+            let signed = api
+                .tx()
+                .create_partial_offline(&call, params)?
+                .sign(&acc.kp);
+            Bytes::from_owner(signed.into_encoded())
         } else {
             let order_id = cancel_id.saturating_sub(1);
             let call = node_runtime::tx().perp_market().cancel_order(
@@ -512,34 +857,129 @@ async fn account_stream_place_cancel(
                 CancelReason::UserCanceled,
             );
             let params = SubstrateExtrinsicParamsBuilder::new().nonce(tx_nonce).build();
-            api.tx()
-                .create_partial_offline(&call, params)
-                .map(|mut p| Bytes::from_owner(p.sign(&acc.kp).into_encoded()))
-        } {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("{} build tx: {e:?}", acc.name);
-                if is_place {
-                    cancel_id = cancel_id.saturating_sub(1);
-                }
-                continue;
-            }
+            let signed = api
+                .tx()
+                .create_partial_offline(&call, params)?
+                .sign(&acc.kp);
+            Bytes::from_owner(signed.into_encoded())
         };
+        out.push(tx_bytes);
+    }
+    Ok(out)
+}
 
-        match rpc.author_submit_extrinsic(&tx_bytes).await {
-            Ok(_) => {
-                GLOBAL_SUBMIT_OK.fetch_add(1, Ordering::Relaxed);
-                i += 1;
-            }
-            Err(e) => {
-                GLOBAL_SUBMIT_ERR.fetch_add(1, Ordering::Relaxed);
-                warn!("{} submit: {:?}", acc.name, e);
-                if is_place {
-                    cancel_id = cancel_id.saturating_sub(1);
+/// 一批 `author_submit_extrinsics`（`Compact(笔数)` 前缀 + 裸编码拼接，与 `perp_bench_fence` 一致）。
+async fn submit_extrinsic_batch(
+    rpc: &LegacyRpcMethods<EthRuntimeConfig>,
+    encoded_inner: &[u8],
+    call_num: u32,
+    batch_label: &str,
+) {
+    if call_num == 0 || encoded_inner.is_empty() {
+        return;
+    }
+    let mut extrinsics: Vec<u8> = Vec::new();
+    Compact(call_num).encode_to(&mut extrinsics);
+    extrinsics.extend_from_slice(encoded_inner);
+    match rpc.author_submit_extrinsics(&extrinsics).await {
+        Ok(batch_res) => {
+            let got = batch_res.len();
+            if got != call_num as usize {
+                if let Some(m) = SUBMIT_ERR_AGG.get() {
+                    m.lock()
+                        .expect("submit err agg lock")
+                        .record_batch_len_mismatch(call_num, got);
+                } else {
+                    warn!(
+                        "author_submit_extrinsics 返回条数与提交笔数不一致: 提交={call_num} 返回={got}"
+                    );
                 }
+            }
+            for (idx, res) in batch_res.into_iter().enumerate() {
+                match res {
+                    Ok(_) => {
+                        GLOBAL_SUBMIT_OK.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        GLOBAL_SUBMIT_ERR.fetch_add(1, Ordering::Relaxed);
+                        record_submit_err(
+                            &format!("{batch_label}/批内 idx={idx} batch_size={call_num}"),
+                            &e,
+                        );
+                    }
+                }
+            }
+            if got < call_num as usize {
+                let missing = call_num as u64 - got as u64;
+                GLOBAL_SUBMIT_ERR.fetch_add(missing, Ordering::Relaxed);
             }
         }
+        Err(e) => {
+            let err_s = submit_err_text(&e);
+            if is_pool_limit_msg(&err_s) {
+                warn!(
+                    "author_submit_extrinsics 整批失败 [pool limit 相关]: {batch_label} batch_size={call_num} err={err_s}"
+                );
+            } else {
+                warn!(
+                    "author_submit_extrinsics 整批失败: {batch_label} batch_size={call_num} err={err_s}"
+                );
+            }
+            record_submit_err(&format!("{batch_label}/整批 batch_size={call_num}"), &e);
+            GLOBAL_SUBMIT_ERR.fetch_add(call_num as u64, Ordering::Relaxed);
+        }
     }
+}
+
+/// 每 `1/RATE` 秒一批：全账户各取第 `tick_idx` 笔，一次 `author_submit_extrinsics`。
+async fn batch_submit_aligned_ticks(
+    prebuilt: &[Vec<Bytes>],
+    rate: u32,
+    n: u32,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    let rpc = get_rpc().await?;
+    let account_count = prebuilt.len();
+    if account_count == 0 {
+        return Ok(());
+    }
+    let spacing = Duration::from_secs_f64(1.0 / rate.max(1) as f64);
+    let mut tick = tokio::time::interval(spacing);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    for tick_idx in 0..n as usize {
+        if Instant::now() >= deadline {
+            let remaining = (n as usize - tick_idx).saturating_mul(account_count);
+            GLOBAL_SUBMIT_SKIP.fetch_add(remaining as u64, Ordering::Relaxed);
+            break;
+        }
+        tick.tick().await;
+        if Instant::now() >= deadline {
+            let remaining = (n as usize - tick_idx).saturating_mul(account_count);
+            GLOBAL_SUBMIT_SKIP.fetch_add(remaining as u64, Ordering::Relaxed);
+            break;
+        }
+
+        let mut encoded_inner: Vec<u8> = Vec::new();
+        for acc_txs in prebuilt {
+            if tick_idx >= acc_txs.len() {
+                anyhow::bail!(
+                    "预编长度不一致: tick_idx={tick_idx} 某账户仅 {} 笔",
+                    acc_txs.len()
+                );
+            }
+            encoded_inner.extend_from_slice(&acc_txs[tick_idx]);
+        }
+        let call_num = account_count as u32;
+        submit_extrinsic_batch(
+            &rpc,
+            &encoded_inner,
+            call_num,
+            &format!("tick={tick_idx}"),
+        )
+        .await;
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -553,7 +993,7 @@ async fn main() -> anyhow::Result<()> {
     let bench = BenchExtra::from_env()?;
     info!("shard: {}", shard.summary());
     info!(
-        "perp_bench: duration={}s scan_conc={} prep_conc={} start_at_ms={:?} skip_prep={} market={} order_size={} matched%={}",
+        "perp_bench: duration={}s scan_conc={} prep_conc={} start_at_ms={:?} skip_prep={} market={} order_size={} post_chain_scan_sec={} matched%={}",
         bench.duration_sec,
         bench.scan_concurrency,
         bench.prep_concurrency,
@@ -561,15 +1001,40 @@ async fn main() -> anyhow::Result<()> {
         bench.skip_prep,
         bench.market_id,
         bench.order_size,
+        bench.post_chain_scan_sec,
         bench.matched_percent,
+    );
+
+    let n_u64 = (shard.rate as u64).saturating_mul(bench.duration_sec);
+    let n: u32 = n_u64.min(u32::MAX as u64) as u32;
+    if n == 0 {
+        anyhow::bail!("RATE×BENCH_DURATION_SEC 结果为 0");
+    }
+    let places_per_account = n_u64.div_ceil(2).min(u32::MAX as u64) as u32;
+    let expected_submit = (shard.account_count as u64).saturating_mul(n as u64);
+    info!(
+        "发压预估：每账户预编 n={} 笔（RATE×DURATION），约 {} 笔 place；共 {} 账户，预编合计 {} 笔；发压 {} 批 × 每批 {} 笔（间隔 1/RATE s）",
+        n,
+        places_per_account,
+        shard.account_count,
+        expected_submit,
+        n,
+        shard.account_count,
     );
 
     GLOBAL_SUBMIT_OK.store(0, Ordering::Relaxed);
     GLOBAL_SUBMIT_ERR.store(0, Ordering::Relaxed);
+    GLOBAL_SUBMIT_SKIP.store(0, Ordering::Relaxed);
+    let _ = SUBMIT_ERR_AGG.get_or_init(|| Mutex::new(SubmitErrAgg::default()));
+    SubmitErrAgg::reset();
 
     let rows = derive_accounts(shard.first_addr_index, shard.account_count)?;
     let mut accounts = resolve_accounts_parallel(rows, bench.scan_concurrency).await?;
     accounts = assign_quotes(accounts, bench.market_id).await?;
+    let account_scan_keys: Vec<(String, H160)> = accounts
+        .iter()
+        .map(|a| (a.name.clone(), a.subaccount))
+        .collect();
     //准备阶段
     if !bench.skip_prep {
         info!("准备阶段：平仓 + 撤挂单（并发 {}）…", bench.prep_concurrency);
@@ -587,30 +1052,109 @@ async fn main() -> anyhow::Result<()> {
     if let Some(t) = bench.start_at_unix_ms {
         sleep_until_unix_ms(t).await;
     }
-    //发压
-    let deadline = Instant::now() + Duration::from_secs(bench.duration_sec);
-    let t0 = Instant::now();
-    let mut set = JoinSet::new();
-    for acc in accounts {
+
+    let pre_chain = if bench.post_chain_scan_sec > 0 {
+        info!(
+            "链上基线：发送前拉取 storage（{} 户，market={}）…",
+            account_scan_keys.len(),
+            bench.market_id
+        );
+        Some(
+            fetch_chain_stats_parallel(
+                &account_scan_keys,
+                bench.market_id,
+                bench.order_size,
+                bench.scan_concurrency,
+            )
+            .await?,
+        )
+    } else {
+        info!("已跳过链上核对（FENCE_POST_CHAIN_SCAN_SEC=0）");
+        None
+    };
+
+    // ─── 并行预编签 ─────────────────────────────────────────────────
+    let t_build = Instant::now();
+    let sem = Arc::new(Semaphore::new(bench.scan_concurrency));
+    let mut build_set = JoinSet::new();
+    let n_accounts = accounts.len();
+    for (idx, acc) in accounts.into_iter().enumerate() {
+        let sem = sem.clone();
         let market_id = bench.market_id;
         let order_size = bench.order_size;
-        let rate = shard.rate;
         let matched = bench.matched_percent;
-        set.spawn(async move {
-            account_stream_place_cancel(acc, market_id, order_size, rate, matched, deadline).await;
+        build_set.spawn(async move {
+            let _p = sem.acquire().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let v = build_account_extrinsics(acc, market_id, order_size, matched, n).await?;
+            Ok::<_, anyhow::Error>((idx, v))
         });
     }
-    while set.join_next().await.is_some() {}
+    let mut prebuilt: Vec<Option<Vec<Bytes>>> = vec![None; n_accounts];
+    while let Some(j) = build_set.join_next().await {
+        let (idx, v) = j??;
+        prebuilt[idx] = Some(v);
+    }
+    let prebuilt: Vec<Vec<Bytes>> = prebuilt
+        .into_iter()
+        .map(|x| x.ok_or_else(|| anyhow::anyhow!("build join internal")))
+        .collect::<anyhow::Result<_>>()?;
+    info!(
+        "编签完成：{} 账户 × n={} 笔，耗时 {:.2}s；开始每 1/RATE 一批 author_submit_extrinsics（每批 {} 笔，墙钟约 {}s）",
+        prebuilt.len(),
+        n,
+        t_build.elapsed().as_secs_f64(),
+        prebuilt.len(),
+        bench.duration_sec,
+    );
 
-    let elapsed = t0.elapsed().as_secs_f64().max(1e-6);
+    // ─── 发压：每 1/RATE 秒一批，全账户各 1 笔 ───────────────────────
+    let deadline = Instant::now() + Duration::from_secs(bench.duration_sec);
+    let t_send = Instant::now();
+    batch_submit_aligned_ticks(&prebuilt, shard.rate, n, deadline).await?;
+
     let ok = GLOBAL_SUBMIT_OK.load(Ordering::Relaxed);
     let err = GLOBAL_SUBMIT_ERR.load(Ordering::Relaxed);
+    let skip = GLOBAL_SUBMIT_SKIP.load(Ordering::Relaxed);
+    log_submit_err_summary(ok, err);
     info!(
-        "结束: submit_ok={} submit_err={} wall={:.2}s 平均提交 {:.1} tx/s",
+        "结束: 发送阶段墙钟 {:.2}s；预编={} submit_ok={} submit_err={} 未发出={}（共 {} 批×{} 笔/批；ok+err+skip 应≈预编）",
+        t_send.elapsed().as_secs_f64(),
+        expected_submit,
         ok,
         err,
-        elapsed,
-        ok as f64 / elapsed
+        skip,
+        n,
+        prebuilt.len(),
     );
+
+    if let Some(pre) = pre_chain {
+        let scan_sec = bench.post_chain_scan_sec;
+        info!("链上收尾：等待 {}s 后再次扫 storage …", scan_sec);
+        tokio::time::sleep(Duration::from_secs(scan_sec)).await;
+        let post = fetch_chain_stats_parallel(
+            &account_scan_keys,
+            bench.market_id,
+            bench.order_size,
+            bench.scan_concurrency,
+        )
+        .await?;
+        log_chain_reconcile(
+            &account_scan_keys,
+            &pre,
+            &post,
+            places_per_account,
+            bench.market_id,
+            scan_sec,
+            ok,
+            err,
+        );
+        diagnose_weak_accounts(
+            &account_scan_keys,
+            &pre,
+            &post,
+            places_per_account,
+        )
+        .await?;
+    }
     Ok(())
 }
