@@ -1,7 +1,7 @@
 //! # 永续压测（`perp_bench`）
 //!
-//! 阶段：**配置 → 派生账户 → 并发解析子账户 →（可选）准备 →（可选）墙钟对齐 → 并行预编签 → 每 `1/RATE` 秒一批 `author_submit_extrinsics`（全账户各 1 笔）**。
-//! 与 `perp_bench_fence` 相同预先构造 `RATE×BENCH_DURATION_SEC` 笔 place/cancel 交替 payload；发压阶段每 `1/RATE` 秒调用一次批量 RPC，每批 `ACCOUNT_COUNT` 笔（每账户取同一 tick 序号的一笔）。
+//! 阶段：**配置 → … → 并行预编签 → 每 `2/RATE` 秒一批 `author_submit_extrinsics`（全账户各 1 组：挂单+撤单共 2 笔）**。
+//! 预编 `RATE×BENCH_DURATION_SEC` 笔 place/cancel 交替 payload；发压按 **(place, cancel)** 成对组批，同批内每账户连续 2 笔一并提交。
 //! 多机：各机配置不同 `FIRST_ADDR_INDEX` / `ACCOUNT_COUNT`，并共用同一`BENCH_START_AT_UNIX_MS` 即可近似同时起跑。
 //!
 //! ```bash
@@ -931,8 +931,8 @@ async fn submit_extrinsic_batch(
     }
 }
 
-/// 每 `1/RATE` 秒一批：全账户各取第 `tick_idx` 笔，一次 `author_submit_extrinsics`。
-async fn batch_submit_aligned_ticks(
+/// 每 `2/RATE` 秒一批：全账户各取一组 `(place, cancel)`，一次 `author_submit_extrinsics`（每批 `2×ACCOUNT_COUNT` 笔）。
+async fn batch_submit_place_cancel_pairs(
     prebuilt: &[Vec<Bytes>],
     rate: u32,
     n: u32,
@@ -943,39 +943,59 @@ async fn batch_submit_aligned_ticks(
     if account_count == 0 {
         return Ok(());
     }
-    let spacing = Duration::from_secs_f64(1.0 / rate.max(1) as f64);
+    if n % 2 != 0 {
+        warn!(
+            "预编笔数 n={n} 为奇数，最后一笔无配对撤单，发压仅发送前 {} 组",
+            n / 2
+        );
+    }
+    let pair_count = n / 2;
+    if pair_count == 0 {
+        return Ok(());
+    }
+    // 每组 2 笔/账户，组间 2/RATE → 墙钟约 pair_count×(2/RATE)=n/RATE=DURATION
+    let spacing = Duration::from_secs_f64(2.0 / rate.max(1) as f64);
     let mut tick = tokio::time::interval(spacing);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-    for tick_idx in 0..n as usize {
+    for pair_idx in 0..pair_count as usize {
         if Instant::now() >= deadline {
-            let remaining = (n as usize - tick_idx).saturating_mul(account_count);
-            GLOBAL_SUBMIT_SKIP.fetch_add(remaining as u64, Ordering::Relaxed);
+            let remaining_pairs = pair_count as usize - pair_idx;
+            GLOBAL_SUBMIT_SKIP.fetch_add(
+                (remaining_pairs.saturating_mul(account_count).saturating_mul(2)) as u64,
+                Ordering::Relaxed,
+            );
             break;
         }
         tick.tick().await;
         if Instant::now() >= deadline {
-            let remaining = (n as usize - tick_idx).saturating_mul(account_count);
-            GLOBAL_SUBMIT_SKIP.fetch_add(remaining as u64, Ordering::Relaxed);
+            let remaining_pairs = pair_count as usize - pair_idx;
+            GLOBAL_SUBMIT_SKIP.fetch_add(
+                (remaining_pairs.saturating_mul(account_count).saturating_mul(2)) as u64,
+                Ordering::Relaxed,
+            );
             break;
         }
 
+        let place_idx = pair_idx * 2;
+        let cancel_idx = place_idx + 1;
         let mut encoded_inner: Vec<u8> = Vec::new();
         for acc_txs in prebuilt {
-            if tick_idx >= acc_txs.len() {
+            if cancel_idx >= acc_txs.len() {
                 anyhow::bail!(
-                    "预编长度不一致: tick_idx={tick_idx} 某账户仅 {} 笔",
+                    "预编长度不一致: pair_idx={pair_idx} 某账户仅 {} 笔",
                     acc_txs.len()
                 );
             }
-            encoded_inner.extend_from_slice(&acc_txs[tick_idx]);
+            encoded_inner.extend_from_slice(&acc_txs[place_idx]);
+            encoded_inner.extend_from_slice(&acc_txs[cancel_idx]);
         }
-        let call_num = account_count as u32;
+        let call_num = (account_count as u32).saturating_mul(2);
         submit_extrinsic_batch(
             &rpc,
             &encoded_inner,
             call_num,
-            &format!("tick={tick_idx}"),
+            &format!("pair={pair_idx}"),
         )
         .await;
     }
@@ -1012,14 +1032,16 @@ async fn main() -> anyhow::Result<()> {
     }
     let places_per_account = n_u64.div_ceil(2).min(u32::MAX as u64) as u32;
     let expected_submit = (shard.account_count as u64).saturating_mul(n as u64);
+    let pair_count = n / 2;
+    let txs_per_batch = (shard.account_count as u64).saturating_mul(2);
     info!(
-        "发压预估：每账户预编 n={} 笔（RATE×DURATION），约 {} 笔 place；共 {} 账户，预编合计 {} 笔；发压 {} 批 × 每批 {} 笔（间隔 1/RATE s）",
+        "发压预估：每账户预编 n={} 笔（RATE×DURATION），{} 组 place+cancel；共 {} 账户，预编合计 {} 笔；发压 {} 批 × 每批 {} 笔（间隔 2/RATE s）",
         n,
-        places_per_account,
+        pair_count,
         shard.account_count,
         expected_submit,
-        n,
-        shard.account_count,
+        pair_count,
+        txs_per_batch,
     );
 
     GLOBAL_SUBMIT_OK.store(0, Ordering::Relaxed);
@@ -1099,32 +1121,32 @@ async fn main() -> anyhow::Result<()> {
         .map(|x| x.ok_or_else(|| anyhow::anyhow!("build join internal")))
         .collect::<anyhow::Result<_>>()?;
     info!(
-        "编签完成：{} 账户 × n={} 笔，耗时 {:.2}s；开始每 1/RATE 一批 author_submit_extrinsics（每批 {} 笔，墙钟约 {}s）",
+        "编签完成：{} 账户 × n={} 笔，耗时 {:.2}s；开始每 2/RATE 一批（每组 place+cancel，每批 {} 笔，墙钟约 {}s）",
         prebuilt.len(),
         n,
         t_build.elapsed().as_secs_f64(),
-        prebuilt.len(),
+        txs_per_batch,
         bench.duration_sec,
     );
 
-    // ─── 发压：每 1/RATE 秒一批，全账户各 1 笔 ───────────────────────
+    // ─── 发压：每 2/RATE 秒一批，全账户各 1 组（place+cancel）──────────
     let deadline = Instant::now() + Duration::from_secs(bench.duration_sec);
     let t_send = Instant::now();
-    batch_submit_aligned_ticks(&prebuilt, shard.rate, n, deadline).await?;
+    batch_submit_place_cancel_pairs(&prebuilt, shard.rate, n, deadline).await?;
 
     let ok = GLOBAL_SUBMIT_OK.load(Ordering::Relaxed);
     let err = GLOBAL_SUBMIT_ERR.load(Ordering::Relaxed);
     let skip = GLOBAL_SUBMIT_SKIP.load(Ordering::Relaxed);
     log_submit_err_summary(ok, err);
     info!(
-        "结束: 发送阶段墙钟 {:.2}s；预编={} submit_ok={} submit_err={} 未发出={}（共 {} 批×{} 笔/批；ok+err+skip 应≈预编）",
+        "结束: 发送阶段墙钟 {:.2}s；预编={} submit_ok={} submit_err={} 未发出={}（共 {} 批×{} 笔/批；每组 place+cancel；ok+err+skip 应≈预编）",
         t_send.elapsed().as_secs_f64(),
         expected_submit,
         ok,
         err,
         skip,
-        n,
-        prebuilt.len(),
+        pair_count,
+        txs_per_batch,
     );
 
     if let Some(pre) = pre_chain {
