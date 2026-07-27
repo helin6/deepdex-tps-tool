@@ -64,9 +64,9 @@ use subtx_test::shard_run_config::{env_truthy, env_u16, env_u64, ShardRunConfig}
 )]
 pub mod node_runtime {}
 
-use node_runtime::perp_market::calls::types::cancel_order::CancelReason;
-use node_runtime::perp_market::calls::types::place_order::OrderType;
-use node_runtime::runtime_types::pallet_primitives::types::PostOnlyParam;
+use node_runtime::runtime_types::pallet_primitives::types::{
+    CancelReason, OrderType, PerpCancelParams, PerpPlaceParams, PostOnlyParam, TimeInForce,
+};
 
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub enum EthRuntimeConfig {}
@@ -756,12 +756,13 @@ async fn prep_one_account(acc: &Account, market_id: u16) -> anyhow::Result<PrepS
         let mut nonce = unix_ms();
         for (mid, ords) in res {
             for ord in ords {
-                let call = node_runtime::tx().perp_market().cancel_order(
-                    acc.subaccount,
-                    ord.order_id,
-                    mid,
-                    CancelReason::UserCanceled,
-                );
+                let call = node_runtime::tx().perp_market().cancel_order(PerpCancelParams {
+                    subaccount: acc.subaccount,
+                    order_id: ord.order_id,
+                    market_id: mid,
+                    cancel_reason: CancelReason::UserCanceled,
+                    fast_cancel: false,
+                });
                 let params = SubstrateExtrinsicParamsBuilder::new().nonce(nonce).build();
                 let signed = api.tx().create_partial_offline(&call, params)?.sign(&acc.kp);
                 match rpc
@@ -848,20 +849,19 @@ async fn build_account_extrinsics(
                 cancel_id,
                 &mut skip_cancel,
             );
-            let call = node_runtime::tx().perp_market().place_order(
-                acc.subaccount,
+            let call = node_runtime::tx().perp_market().place_order(PerpPlaceParams {
+                subaccount: acc.subaccount,
                 market_id,
-                acc.is_long,
-                order_size,
+                is_long: acc.is_long,
+                size: order_size,
                 price,
-                OrderType::Limit,
-                None,
-                2,
-                None,
-                None,
-                false,
-                PostOnlyParam::None,
-            );
+                order_type: OrderType::Limit(TimeInForce::GTC),
+                take_profit: None,
+                stop_loss: None,
+                reduce_only: false,
+                post_only: PostOnlyParam::None,
+                cloid: None,
+            });
             let params = SubstrateExtrinsicParamsBuilder::new().nonce(tx_nonce).build();
             let signed = api
                 .tx()
@@ -870,12 +870,13 @@ async fn build_account_extrinsics(
             Bytes::from_owner(signed.into_encoded())
         } else {
             let order_id = cancel_id.saturating_sub(1);
-            let call = node_runtime::tx().perp_market().cancel_order(
-                acc.subaccount,
+            let call = node_runtime::tx().perp_market().cancel_order(PerpCancelParams {
+                subaccount: acc.subaccount,
                 order_id,
                 market_id,
-                CancelReason::UserCanceled,
-            );
+                cancel_reason: CancelReason::UserCanceled,
+                fast_cancel: false,
+            });
             let params = SubstrateExtrinsicParamsBuilder::new().nonce(tx_nonce).build();
             let signed = api
                 .tx()
